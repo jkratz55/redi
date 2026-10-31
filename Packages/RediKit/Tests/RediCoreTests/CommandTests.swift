@@ -129,4 +129,89 @@ struct CommandCatalogTests {
         await #expect(throws: RedisSession.SessionError.self) { try await session.send(RedisCommand("FLUSHALL")) }
         await session.close()
     }
+
+    private func check(_ line: String, table: CommandTable = .empty) throws -> CommandSafety.ReadOnlyCheck {
+        CommandSafety.readOnlyCheck(try CommandLineParser.split(line), table: table)
+    }
+
+    @Test("Read-only mode without server metadata fails closed")
+    func readOnlyWithoutMetadata() throws {
+        // Everything the app itself sends through a session while browsing a read-only connection.
+        for line in ["TYPE k", "PTTL k", "TTL k", "EXISTS k", "DUMP k", "SCAN 0 MATCH * COUNT 500", "DBSIZE", "INFO", "INFO server",
+                     "CONFIG GET databases", "MEMORY USAGE k", "OBJECT ENCODING k", "GET k", "STRLEN k", "GETRANGE k 0 9",
+                     "HSCAN k 0", "HLEN k", "HTTL k FIELDS 1 f", "LRANGE k 0 9", "LLEN k", "SSCAN k 0", "SCARD k",
+                     "ZRANGE k 0 9 WITHSCORES", "ZREVRANGE k 0 9", "ZSCAN k 0", "ZCARD k", "XREVRANGE k + - COUNT 10", "XLEN k",
+                     "XINFO GROUPS k", "XINFO CONSUMERS k g", "XPENDING k g - + 10", "JSON.GET k", "VCARD k", "SLOWLOG GET 128",
+                     "PUBSUB CHANNELS", "PUBSUB NUMSUB ch", "COMMAND DOCS", "PING", "EVAL_RO \"return 1\" 0", "FCALL_RO f 0"] {
+            #expect(try check(line) == .allowed, "\(line)")
+        }
+        for line in ["SET k v", "DEL k", "HSET k f v", "XGROUP CREATE k g $", "EVAL \"return 1\" 0", "EVALSHA abc 0", "FCALL f 0",
+                     "PUBLISH ch m", "CONFIG SET maxmemory 1", "SLOWLOG RESET", "CLUSTER SETSLOT 1 NODE x", "FLUSHDB"] {
+            #expect(try check(line) == .forbidden, "\(line)")
+        }
+        // Unknown to Redi and the server didn't say: refused rather than guessed.
+        for line in ["BLMOVE a b LEFT RIGHT 0", "FT.CREATE idx SCHEMA f TEXT", "ACL LOG RESET", "MYMODULE.DO x", "CLIENT KILL ID 1"] {
+            #expect(try check(line) != .allowed, "\(line)")
+        }
+        #expect(try check("MYMODULE.DO x") == .unverified)
+    }
+
+    @Test("Read-only mode refuses scripts and admin writes the server doesn't flag", .enabled(if: RedisServerFixture.isAvailable))
+    func readOnlyScripts() async throws {
+        let server = try await RedisServerFixture()
+        let writer = try await RedisConnection.connect(server.configuration())
+        try await writer.execute(RedisCommand("FUNCTION", "LOAD", """
+            #!lua name=redi
+            redis.register_function('touchkey', function(keys) return redis.call('SET', keys[1], 'changed') end)
+            redis.register_function{function_name='readkey', callback=function(keys) return redis.call('GET', keys[1]) end, flags={'no-writes'}}
+            """))
+        try await writer.execute(RedisCommand("SET", "k", "original"))
+        let sha = try #require(try await writer.execute(RedisCommand("SCRIPT", "LOAD", "return redis.call('SET', KEYS[1], 'changed')")).string)
+
+        let session = RedisSession(configuration: server.configuration(), options: RedisSession.Options(isReadOnly: true))
+        let table = try await session.commandTable()
+        #expect(table.info(named: "eval")?.isWrite == false, "Redis doesn't flag EVAL as a write; the explicit list must catch it")
+        for command in [RedisCommand("EVAL", "return redis.call('SET', KEYS[1], 'changed')", 1, "k"),
+                        RedisCommand("EVALSHA", sha, 1, "k"), RedisCommand("FCALL", "touchkey", 1, "k"),
+                        RedisCommand("PUBLISH", "ch", "m"), RedisCommand("SLOWLOG", "RESET")] {
+            await #expect(throws: RedisSession.SessionError.readOnly(command.name)) { try await session.send(command) }
+        }
+        #expect(try await session.execute(RedisCommand("EVAL_RO", "return redis.call('GET', KEYS[1])", 1, "k")).string == "original")
+        #expect(try await session.execute(RedisCommand("FCALL_RO", "readkey", 1, "k")).string == "original")
+
+        // fanOut is a public dispatch path too.
+        await #expect(throws: RedisSession.SessionError.readOnly("SET")) { try await session.fanOut(RedisCommand("SET", "k", "changed")) }
+        await #expect(throws: RedisSession.SessionError.self) {
+            try await session.fanOut(RedisCommand("CONFIG", "SET", "slowlog-log-slower-than", 1))
+        }
+        #expect(try await session.fanOut(RedisCommand("DBSIZE")).first?.reply.int == 1)
+        await #expect(throws: RedisSession.SessionError.self) {
+            try await session.pipeline([RedisCommand("GET", "k"), RedisCommand("EVAL", "return 1", 0)])
+        }
+
+        #expect(try await writer.execute(RedisCommand("GET", "k")).string == "original")
+        await session.close()
+        await writer.close()
+    }
+
+    @Test("Read-only mode fails closed when the server denies COMMAND", .enabled(if: RedisServerFixture.isAvailable))
+    func readOnlyWithoutCommandAccess() async throws {
+        let server = try await RedisServerFixture()
+        let admin = try await RedisConnection.connect(server.configuration())
+        try await admin.execute(RedisCommand("ACL", "SETUSER", "nocommand", "on", ">secret", "~*", "&*", "+@all", "-command"))
+        try await admin.execute(RedisCommand("SET", "k", "v"))
+
+        let session = RedisSession(configuration: server.configuration(username: "nocommand", password: "secret"),
+                                   options: RedisSession.Options(isReadOnly: true))
+        #expect(try await session.commandTable().isEmpty)
+        #expect(try await session.execute(RedisCommand("GET", "k")).string == "v")
+        #expect(try await session.execute(RedisCommand("TYPE", "k")).string == "string")
+        await #expect(throws: RedisSession.SessionError.readOnly("SET")) { try await session.send(RedisCommand("SET", "k", "x")) }
+        await #expect(throws: RedisSession.SessionError.readOnlyUnverified("BLMOVE")) {
+            try await session.send(RedisCommand("BLMOVE", "k", "other", "LEFT", "RIGHT", 0))
+        }
+        #expect(try await admin.execute(RedisCommand("GET", "k")).string == "v")
+        await session.close()
+        await admin.close()
+    }
 }

@@ -83,11 +83,23 @@ struct ClusterLiveTests {
 /// Against `Scripts/dev-redis.sh sentinel start` (sentinels 26379-26381, master "redi-primary").
 @Suite("Live sentinel", .enabled(if: LivePorts.isListening(26379)), .serialized)
 struct SentinelLiveTests {
-    private func sentinelSession() -> RedisSession {
+    private func sentinelSession(isReadOnly: Bool = false) -> RedisSession {
         RedisSession(configuration: RedisConnectionConfiguration(endpoint: .tcp(host: "127.0.0.1", port: 26379)),
                      options: RedisSession.Options(mode: .sentinel(.init(masterName: "redi-primary", sentinels: [
                          .tcp(host: "127.0.0.1", port: 26379), .tcp(host: "127.0.0.1", port: 26380), .tcp(host: "127.0.0.1", port: 26381),
-                     ]))))
+                     ])), isReadOnly: isReadOnly))
+    }
+
+    @Test("A read-only session takes command metadata from the primary, not the Sentinel")
+    func readOnlyMetadata() async throws {
+        let session = sentinelSession(isReadOnly: true)
+        // No explicit open: the first command opens the session before checking it.
+        #expect(try await session.send(RedisCommand("GET", "redi:test:sentinel")).serverError == nil)
+        #expect(try await session.commandTable().info(named: "set")?.isWrite == true)
+        await #expect(throws: RedisSession.SessionError.readOnly("SET")) {
+            try await session.send(RedisCommand("SET", "redi:test:sentinel", "1"))
+        }
+        await session.close()
     }
 
     @Test("Lists masters and resolves the primary")

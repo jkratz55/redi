@@ -85,6 +85,8 @@ public actor RedisSession {
 
     public enum SessionError: Error, Sendable, Hashable, CustomStringConvertible {
         case readOnly(String)
+        /// Read-only mode couldn't confirm the command only reads (no server metadata for it).
+        case readOnlyUnverified(String)
         case tooManyRedirects
         case noNodeForSlot(Int)
         case notCluster
@@ -92,6 +94,8 @@ public actor RedisSession {
         public var description: String {
             switch self {
             case .readOnly(let command): "\(command) is blocked because this connection is read-only."
+            case .readOnlyUnverified(let command):
+                "\(command) is blocked because this connection is read-only, and the server didn't report whether \(command) only reads data."
             case .tooManyRedirects: "The cluster redirected the command too many times."
             case .noNodeForSlot(let slot): "No cluster node serves slot \(slot)."
             case .notCluster: "This server isn't part of a cluster."
@@ -210,7 +214,9 @@ public actor RedisSession {
     // MARK: - Connections
 
     /// The live connection for `role` on `node` (default: the primary, or the first cluster primary).
-    public func connection(for role: Role = .command, node: RedisEndpoint? = nil) async throws -> RedisConnection {
+    /// Commands sent on it skip read-only enforcement, so it's internal: only the streaming
+    /// listeners (SUBSCRIBE, MONITOR) need it. Everything else goes through `send`, `pipeline` or `fanOut`.
+    func connection(for role: Role = .command, node: RedisEndpoint? = nil) async throws -> RedisConnection {
         if !isOpen { try await open() }
         return try await rawConnection(role: role, node: node ?? defaultNode)
     }
@@ -263,7 +269,7 @@ public actor RedisSession {
     public func send(_ command: RedisCommand, role: Role = .command, target: Target = .automatic) async throws -> RESPValue {
         try await enforceReadOnly(command)
         if case .allPrimaries = target {
-            let replies = try await fanOut(command, role: role)
+            let replies = try await unguardedFanOut(command, role: role)
             return .map(replies.map { RESPPair(.simpleString($0.node.description), $0.reply) })
         }
         if !isOpen { try await open() }
@@ -347,6 +353,12 @@ public actor RedisSession {
 
     /// Runs a command on every primary concurrently (e.g. `DBSIZE`, `INFO`, `SLOWLOG GET`).
     public func fanOut(_ command: RedisCommand, role: Role = .command) async throws -> [NodeReply] {
+        try await enforceReadOnly(command)
+        return try await unguardedFanOut(command, role: role)
+    }
+
+    /// `fanOut` without the read-only check, for callers that already ran it.
+    private func unguardedFanOut(_ command: RedisCommand, role: Role) async throws -> [NodeReply] {
         if !isOpen { try await open() }
         let nodes = primaries()
         var connections: [RedisConnection] = []
@@ -392,9 +404,16 @@ public actor RedisSession {
 
     private func enforceReadOnly(_ command: RedisCommand) async throws {
         guard options.isReadOnly else { return }
-        let table = (try? await commandTable()) ?? .empty
-        if CommandSafety.isForbiddenInReadOnlyMode(command.arguments, table: table) {
-            throw SessionError.readOnly(command.name)
+        // Open first, so the table comes from the data server (through the tunnel, or from the
+        // primary Sentinel resolved) rather than the configured address.
+        if !isOpen { try await open() }
+        // A failure to fetch the table (e.g. the server is unreachable) is thrown as-is, so it isn't
+        // reported as a read-only refusal. A server that refuses COMMAND yields an empty table.
+        let table = try await commandTable()
+        switch CommandSafety.readOnlyCheck(command.arguments, table: table) {
+        case .allowed: return
+        case .forbidden: throw SessionError.readOnly(command.name)
+        case .unverified: throw SessionError.readOnlyUnverified(command.name)
         }
     }
 
