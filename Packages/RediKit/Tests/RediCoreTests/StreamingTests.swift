@@ -1,6 +1,7 @@
 import Foundation
 import RedisClient
 import RedisWire
+import Synchronization
 import Testing
 @testable import RediCore
 @testable import RedisTestSupport
@@ -93,5 +94,88 @@ struct StreamingLiveTests {
         #expect(set.arguments == #""monitored" "value""#)
         await monitor.stop()
         await session.close()
+    }
+}
+
+/// The scripted transports a session has created, in order.
+private final class TransportLog: Sendable {
+    private let storage = Mutex<[ScriptedTransport]>([])
+    var count: Int { storage.withLock { $0.count } }
+    subscript(index: Int) -> ScriptedTransport { storage.withLock { $0[index] } }
+    func append(_ transport: ScriptedTransport) -> Int {
+        storage.withLock { $0.append(transport); return $0.count - 1 }
+    }
+}
+
+/// A session whose connections are scripted transports. Transport 0 is the command connection and
+/// transport 1 the first subscriber; `failing` lists the transports that refuse every command, so
+/// connecting through them fails.
+private func scriptedPubSubSession(failing: Set<Int>) -> (RedisSession, TransportLog) {
+    let log = TransportLog()
+    let session = RedisSession(configuration: .init(endpoint: .tcp(host: "scripted", port: 6379)), transportFactory: { _ in
+        let base = ScriptedTransport.minimalServer()
+        let index = Mutex(0)
+        let transport = ScriptedTransport { arguments in
+            if failing.contains(index.withLock { $0 }) { return .error(RedisServerError("ERR simulated outage")) }
+            if arguments.first == "SUBSCRIBE" { return .push(["subscribe", .bulkString(Array(arguments[1].utf8)), 1]) }
+            return base(arguments)
+        }
+        let position = log.append(transport)
+        index.withLock { $0 = position }
+        return transport
+    })
+    return (session, log)
+}
+
+@Suite("Pub/Sub reconnection", .serialized)
+struct PubSubReconnectTests {
+    @Test("Keeps retrying with backoff until the server is back", .timeLimit(.minutes(1)))
+    func retriesUntilRecovered() async throws {
+        let (session, transports) = scriptedPubSubSession(failing: [2, 3])
+        let listener = PubSubListener(session: session)
+        var events = listener.events.makeAsyncIterator()
+        try await listener.subscribe(channels: ["news"], patterns: [])
+        transports[1].close()
+
+        var lost = 0
+        var recovered = false
+        while !recovered, let event = await events.next() {
+            if case .connectionLost = event { lost += 1 }
+            if case .resubscribed = event { recovered = true }
+        }
+        #expect(lost == 1, "one outage, however many attempts it takes")
+        let count = transports.count
+        #expect(count == 5, "two failed attempts, then a working one")
+        #expect(transports[4].receivedCommands.contains(["SUBSCRIBE", "news"]))
+        await listener.stop()
+        await session.close()
+    }
+
+    @Test("Stopping during the backoff ends the retries")
+    func stopEndsRetries() async throws {
+        let (session, transports) = scriptedPubSubSession(failing: Set(2..<100))
+        let listener = PubSubListener(session: session)
+        try await listener.subscribe(channels: ["news"], patterns: [])
+        transports[1].close()
+        // The first attempt runs after 0.5 s and fails; stop while waiting for the next one.
+        while transports.count < 3 { try await Task.sleep(for: .milliseconds(20)) }
+        await listener.stop()
+        let afterStop = transports.count
+        try await Task.sleep(for: .seconds(2))
+        #expect(transports.count == afterStop)
+        await session.close()
+    }
+
+    @Test("Stops retrying once the session is closed")
+    func closedSessionEndsRetries() async throws {
+        let (session, transports) = scriptedPubSubSession(failing: Set(2..<100))
+        let listener = PubSubListener(session: session)
+        try await listener.subscribe(channels: ["news"], patterns: [])
+        transports[1].close()
+        while transports.count < 3 { try await Task.sleep(for: .milliseconds(20)) }
+        await session.close()
+        let afterClose = transports.count
+        try await Task.sleep(for: .seconds(2))
+        #expect(transports.count == afterClose)
     }
 }

@@ -121,6 +121,14 @@ public actor PubSubListener {
     private var patterns: [String] = []
     private var shardChannels: [String] = []
     private var readers: [Task<Void, Never>] = []
+    /// Bumped whenever the readers are replaced, so a drop reported by an old reader is ignored.
+    private var readerGeneration = 0
+    /// Retries after a dropped connection, independent of the readers (which it replaces).
+    private var reconnectTask: Task<Void, Never>?
+    /// `subscribe` or `stop` is replacing the readers; drops then are expected, not outages.
+    private var isReconfiguring = false
+    /// A new reader dropped while a reconnect attempt was still subscribing the others.
+    private var droppedWhileReconnecting = false
     private var isStopped = false
 
     public init(session: RedisSession) {
@@ -132,6 +140,9 @@ public actor PubSubListener {
 
     /// Replaces the current subscriptions.
     public func subscribe(channels: [String], patterns: [String], sharded: [String] = []) async throws {
+        isReconfiguring = true
+        defer { isReconfiguring = false }
+        await cancelReconnect()
         await stopReaders()
         isStopped = false
         self.channels = channels
@@ -142,6 +153,9 @@ public actor PubSubListener {
 
     public func stop() async {
         isStopped = true
+        isReconfiguring = true
+        defer { isReconfiguring = false }
+        await cancelReconnect()
         await stopReaders()
         channels = []
         patterns = []
@@ -149,16 +163,26 @@ public actor PubSubListener {
     }
 
     private func stopReaders() async {
+        readerGeneration += 1
         for reader in readers { reader.cancel() }
         readers.removeAll()
         await session.release(.subscriber)
+    }
+
+    /// Stops retrying, and waits for an attempt in progress to finish (and clean up after itself),
+    /// so it can't resubscribe after `stop` or alongside a new `subscribe`.
+    private func cancelReconnect() async {
+        guard let task = reconnectTask else { return }
+        task.cancel()
+        await task.value
+        reconnectTask = nil
     }
 
     private func start() async throws {
         if !channels.isEmpty || !patterns.isEmpty {
             let connection = try await session.connection(for: .subscriber)
             try await subscribe(connection, commands: commandsForGlobal())
-            readers.append(read(connection, node: nil))
+            readers.append(read(connection, node: nil, generation: readerGeneration))
         }
         if !shardChannels.isEmpty {
             var byNode: [RedisEndpoint: [String]] = [:]
@@ -171,7 +195,7 @@ public actor PubSubListener {
             for (node, channels) in byNode {
                 let connection = try await session.connection(for: .subscriber, node: node)
                 try await subscribe(connection, commands: [RedisCommand("SSUBSCRIBE", channels)])
-                readers.append(read(connection, node: node))
+                readers.append(read(connection, node: node, generation: readerGeneration))
             }
         }
     }
@@ -188,7 +212,7 @@ public actor PubSubListener {
     }
 
     /// Reads one connection's pushes; messages are delivered in batches every 50 ms.
-    private func read(_ connection: RedisConnection, node: RedisEndpoint?) -> Task<Void, Never> {
+    private func read(_ connection: RedisConnection, node: RedisEndpoint?, generation: Int) -> Task<Void, Never> {
         let continuation = self.continuation
         return Task { [weak self] in
             let batcher = Batcher<PubSubMessage>()
@@ -204,24 +228,50 @@ public actor PubSubListener {
             let rest = batcher.drain()
             if !rest.isEmpty { continuation.yield(.messages(rest)) }
             guard !Task.isCancelled else { return }
-            await self?.connectionDropped(node: node)
+            await self?.connectionDropped(node: node, generation: generation)
         }
     }
 
-    private func connectionDropped(node: RedisEndpoint?) async {
-        guard !isStopped else { return }
+    /// Starts retrying in a task of its own. The reader that reported the drop is about to be
+    /// cancelled (with every other reader) when the subscriptions are rebuilt, so it can't run
+    /// the retries itself.
+    private func connectionDropped(node: RedisEndpoint?, generation: Int) {
+        guard !isStopped, !isReconfiguring, generation == readerGeneration else { return }
+        if reconnectTask != nil {
+            droppedWhileReconnecting = true
+            return
+        }
         continuation.yield(.connectionLost(node?.description ?? ""))
+        reconnectTask = Task { await self.reconnect() }
+    }
+
+    /// Rebuilds every subscription with exponential backoff (0.5 s doubling to 15 s) until it
+    /// works, the listener is stopped or resubscribed, or the session is closed.
+    private func reconnect() async {
+        defer { reconnectTask = nil }
         var delay = Duration.milliseconds(500)
-        while !isStopped, !Task.isCancelled {
+        while !Task.isCancelled {
             try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, await !session.isClosed else { return }
+            await stopReaders()
+            droppedWhileReconnecting = false
             do {
-                await stopReaders()
                 try await start()
-                continuation.yield(.resubscribed)
-                return
             } catch {
                 delay = min(delay * 2, .seconds(15))
+                continue
             }
+            // Superseded by `stop` or `subscribe` while starting: undo, and leave it to them.
+            guard !Task.isCancelled else {
+                await stopReaders()
+                return
+            }
+            if droppedWhileReconnecting {
+                delay = min(delay * 2, .seconds(15))
+                continue
+            }
+            continuation.yield(.resubscribed)
+            return
         }
     }
 

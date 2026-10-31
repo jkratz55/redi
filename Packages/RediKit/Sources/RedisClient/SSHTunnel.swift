@@ -194,6 +194,9 @@ public final class SSHTunnel: Sendable {
     /// Whether the master connection is still alive.
     public var isRunning: Bool { master.process.isRunning }
 
+    /// The ssh master's process ID.
+    public var processIdentifier: Int32 { master.process.processIdentifier }
+
     /// Stops the master (which tears down every forward) and removes the temporary directory.
     public func close() {
         let alreadyClosed = state.withLock { state -> Bool in

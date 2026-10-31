@@ -53,4 +53,43 @@ struct SSHLiveTests {
         #expect(try await session.send(RedisCommand("GET", "redi:ssh"), role: .scan).string == "ok")
         await session.close()
     }
+
+    @Test("A session and its subscriptions recover when the ssh master dies", .timeLimit(.minutes(1)))
+    func recoversDeadTunnel() async throws {
+        var options = RedisSession.Options()
+        options.tunnel = tunnelConfiguration()
+        let session = RedisSession(configuration: RedisConnectionConfiguration(endpoint: .tcp(host: "redis-private", port: 6379), password: "tunnel"),
+                                   options: options)
+        try await session.open()
+        try await session.execute(RedisCommand("SET", "redi:ssh:recover", "before"))
+        let listener = PubSubListener(session: session)
+        var events = listener.events.makeAsyncIterator()
+        try await listener.subscribe(channels: ["redi:ssh"], patterns: [])
+        while let event = await events.next() {
+            if case .subscribed = event { break }
+        }
+
+        // What a network drop or sleep does once ssh's keepalive gives up: the master exits.
+        let old = try #require(await session.currentTunnel)
+        kill(old.processIdentifier, SIGKILL)
+        while old.isRunning { try await Task.sleep(for: .milliseconds(20)) }
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(try await session.execute(RedisCommand("GET", "redi:ssh:recover")).string == "before")
+        let replacement = try #require(await session.currentTunnel)
+        #expect(replacement !== old && replacement.isRunning)
+
+        // Resubscribed, then confirmed by the server through the new tunnel.
+        var recovered = false
+        while let event = await events.next() {
+            if case .resubscribed = event { recovered = true }
+            if recovered, case .subscribed = event { break }
+        }
+        let receivers = try await listener.publish(channel: "redi:ssh", message: Array("after".utf8))
+        #expect(receivers == 1, "one subscriber, not a duplicate left from the old tunnel")
+        await listener.stop()
+        await session.close()
+        for _ in 0..<100 where replacement.isRunning { try await Task.sleep(for: .milliseconds(20)) }
+        #expect(!replacement.isRunning)
+    }
 }

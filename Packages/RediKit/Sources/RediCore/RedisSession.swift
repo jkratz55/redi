@@ -126,11 +126,13 @@ public actor RedisSession {
     private let transportFactory: RedisTransportFactory
     private let eventContinuation: AsyncStream<Event>.Continuation
     private var tunnel: SSHTunnel?
+    private var tunnelTask: Task<SSHTunnel, any Error>?
     private var connections: [Key: RedisConnection] = [:]
     private var connecting: [Key: Task<RedisConnection, any Error>] = [:]
     private var openTask: Task<ServerHello, any Error>?
     private var isOpen = false
-    private var isClosed = false
+    /// Set by `close()`; a closed session can't be reused.
+    public private(set) var isClosed = false
     private var table: CommandTable?
     private var tableTask: Task<CommandTable, any Error>?
     private var topologyRefresh: Task<Void, Never>?
@@ -171,9 +173,7 @@ public actor RedisSession {
 
     private func performOpen() async throws -> ServerHello {
         if isClosed { throw RedisClientError.connectionClosed }
-        if let tunnelConfiguration = options.tunnel, tunnel == nil || tunnel?.isRunning == false {
-            tunnel = try await SSHTunnel.open(tunnelConfiguration)
-        }
+        _ = try await liveTunnel()
         if case .sentinel(let sentinel) = options.mode {
             primaryEndpoint = try await resolveSentinelPrimary(sentinel)
             startSentinelWatcher(sentinel)
@@ -245,6 +245,35 @@ public actor RedisSession {
         return connection
     }
 
+    /// The SSH tunnel (`nil` without one), reopened if its ssh master has exited, e.g. after the
+    /// network dropped or the Mac slept past ssh's keepalive. Forwards and connections made through
+    /// the old master are dead with it, so they're dropped and replacements go through the new one.
+    private func liveTunnel() async throws -> SSHTunnel? {
+        guard let tunnelConfiguration = options.tunnel else { return nil }
+        if let tunnel, tunnel.isRunning { return tunnel }
+        if let tunnelTask { return try await tunnelTask.value }
+        let task = Task { try await SSHTunnel.open(tunnelConfiguration) }
+        tunnelTask = task
+        defer { tunnelTask = nil }
+        if let dead = tunnel {
+            tunnel = nil
+            dead.close()
+            let stale = connections.values
+            connections.removeAll()
+            for connection in stale { await connection.close() }
+        }
+        let opened = try await task.value
+        if isClosed {
+            opened.close()
+            throw RedisClientError.connectionClosed
+        }
+        tunnel = opened
+        return opened
+    }
+
+    /// The tunnel in use, for tests.
+    var currentTunnel: SSHTunnel? { tunnel }
+
     private func connectionConfiguration(for node: RedisEndpoint, sentinel: SentinelOptions? = nil) async throws -> RedisConnectionConfiguration {
         var configuration = self.configuration
         configuration.database = (isCluster || sentinel != nil) ? 0 : database
@@ -252,7 +281,7 @@ public actor RedisSession {
             configuration.username = sentinel.username
             configuration.password = sentinel.password
         }
-        if let tunnel, case .tcp(let host, let port) = node {
+        if let tunnel = try await liveTunnel(), case .tcp(let host, let port) = node {
             configuration.endpoint = try await tunnel.forward(to: host, port: port)
             if configuration.tls != nil, configuration.tls?.serverName == nil {
                 configuration.tls?.serverName = host
