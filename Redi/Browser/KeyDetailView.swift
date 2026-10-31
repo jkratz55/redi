@@ -184,10 +184,24 @@ struct KeyDetailView: View {
 
 // MARK: - Shared pieces
 
-/// Search field + "Load more" footer for paged collections.
+/// How values are shown: Unicode, JSON, MessagePack, HEX…
+struct FormatPicker: View {
+    @Binding var selection: ValueFormat
+
+    var body: some View {
+        Picker("Format", selection: $selection) {
+            ForEach(ValueFormat.allCases) { Text($0.displayName).tag($0) }
+        }
+        .fixedSize()
+        .help("How values are shown")
+    }
+}
+
+/// Search field, value format and actions for paged collections.
 struct CollectionToolbar<Trailing: View>: View {
     @Binding var search: String
     let supportsSearch: Bool
+    @Binding var format: ValueFormat
     let onSearch: () -> Void
     @ViewBuilder var trailing: Trailing
 
@@ -199,6 +213,7 @@ struct CollectionToolbar<Trailing: View>: View {
                     .frame(maxWidth: 260)
                     .onSubmit(onSearch)
             }
+            FormatPicker(selection: $format)
             Spacer()
             trailing
         }
@@ -229,23 +244,36 @@ struct LoadMoreFooter: View {
 }
 
 /// Editable text that round-trips binary safely: UTF-8 text shows as-is, anything else uses
-/// `\xHH` escapes.
+/// `\xHH` escapes. In the MessagePack format, MessagePack values show decoded and read-only.
 struct BinaryText {
     var text: String
     let isEscaped: Bool
+    /// The original bytes when `text` is a read-only decoding of them.
+    let decodedFrom: [UInt8]?
 
-    init(_ bytes: [UInt8]) {
+    init(_ bytes: [UInt8], format: ValueFormat = .text, style: MessagePack.Style = .pretty) {
+        if format == .messagePack, let decoded = ValueFormatter.messagePackElement(bytes, style: style) {
+            text = decoded
+            isEscaped = false
+            decodedFrom = bytes
+            return
+        }
         isEscaped = !ValueFormatter.isText(bytes) && !bytes.isEmpty
         text = isEscaped ? ValueFormatter.escaped(bytes) : String(decoding: bytes, as: UTF8.self)
+        decodedFrom = nil
     }
 
     init(text: String = "") {
         self.text = text
         isEscaped = false
+        decodedFrom = nil
     }
 
+    var isEditable: Bool { decodedFrom == nil }
+
     func bytes() throws -> [UInt8] {
-        isEscaped ? try ValueFormatter.unescape(text) : Array(text.utf8)
+        if let decodedFrom { return decodedFrom }
+        return isEscaped ? try ValueFormatter.unescape(text) : Array(text.utf8)
     }
 }
 
@@ -271,17 +299,21 @@ struct ElementEditorSheet: View {
     var body: some View {
         Form {
             ForEach($fields) { $field in
+                let isEditable = field.isEditable && field.value.isEditable
                 if field.isMultiline {
                     LabeledContent(field.label) {
-                        PlainTextView(text: $field.value.text, isEditable: field.isEditable)
+                        PlainTextView(text: $field.value.text, isEditable: isEditable)
                             .frame(minHeight: 140)
                     }
                 } else {
                     TextField(field.label, text: $field.value.text)
-                        .disabled(!field.isEditable)
+                        .disabled(!isEditable)
                 }
                 if field.value.isEscaped {
                     Text("Binary value: non-text bytes are shown as \\xHH escapes.").font(.caption).foregroundStyle(.secondary)
+                } else if !field.value.isEditable {
+                    Text("Decoded from MessagePack, so it can't be edited here. To edit the raw bytes, choose Unicode in the Format menu.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             if let extraLabel {

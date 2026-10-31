@@ -81,6 +81,40 @@ final class RediUITests: XCTestCase {
         screenshot("Stream detail")
     }
 
+    /// MessagePack values (encoded by a Go service with vmihailenco/msgpack) show decoded.
+    @MainActor
+    func testMessagePackValues() throws {
+        let workspace = connect(name: "MessagePack Test")
+        let filter = workspace.textFields["browser.filter"]
+        XCTAssertTrue(filter.waitForExistence(timeout: 5))
+        filter.click()
+        filter.typeText("ui:msgpack\r")
+        let stringRow = workspace.staticTexts["ui:msgpack"].firstMatch
+        XCTAssertTrue(stringRow.waitForExistence(timeout: 5))
+        stringRow.click()
+        let decoded = workspace.textViews.matching(NSPredicate(format: "value CONTAINS %@", "\"created\": timestamp(2023-11-14T22:13:20Z)"))
+        XCTAssertTrue(decoded.firstMatch.waitForExistence(timeout: 5), "The string should be detected as MessagePack and decoded")
+        XCTAssertTrue(workspace.popUpButtons.matching(NSPredicate(format: "value == 'MessagePack'")).firstMatch.exists)
+        screenshot("MessagePack string")
+
+        filter.click()
+        filter.typeKey("a", modifierFlags: .command)
+        filter.typeText("ui:msgpack-hash\r")
+        let hashRow = workspace.staticTexts["ui:msgpack-hash"].firstMatch
+        XCTAssertTrue(hashRow.waitForExistence(timeout: 5))
+        hashRow.click()
+        let cell = workspace.staticTexts[#"{"sku": "A-1", "qty": 2, "price": 9.99}"#]
+        XCTAssertTrue(cell.waitForExistence(timeout: 5), "Hash values should show decoded")
+        XCTAssertTrue(workspace.staticTexts["plain text"].exists, "Text values in the same hash stay as they are")
+        screenshot("MessagePack hash")
+
+        cell.doubleClick()
+        let note = workspace.staticTexts.matching(NSPredicate(format: "value BEGINSWITH 'Decoded from MessagePack'")).firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5), "The editor should show the value decoded and read-only")
+        screenshot("MessagePack field editor")
+        workspace.sheets.firstMatch.buttons["Cancel"].click()
+    }
+
     private func open(_ item: String, in workspace: XCUIElement) {
         let row = workspace.outlines.staticTexts[item]
         XCTAssertTrue(row.waitForExistence(timeout: 5), "Sidebar item \(item)")

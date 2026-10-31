@@ -165,16 +165,24 @@ final class CollectionPager<Element: Identifiable & Sendable> {
     /// Cursor or offset for the next page; `nil` when everything is loaded.
     private(set) var next: String? = "0"
     var search = ""
+    /// How element values are shown. Chosen from the first page that has elements, unless set first.
+    var format: ValueFormat = .text {
+        didSet { hasFormat = true }
+    }
     let supportsSearch: Bool
     let pageSize = 200
 
     @ObservationIgnored private let fetch: (_ cursor: String, _ pattern: String?) async throws -> ValuePage<Element>
     @ObservationIgnored private let report: (any Error) -> Void
+    /// The values of an element that `format` applies to, for picking the initial format.
+    @ObservationIgnored private let formattedValues: (Element) -> [[UInt8]]
+    @ObservationIgnored private(set) var hasFormat = false
 
-    init(supportsSearch: Bool, report: @escaping (any Error) -> Void,
+    init(supportsSearch: Bool, report: @escaping (any Error) -> Void, formattedValues: @escaping (Element) -> [[UInt8]],
          fetch: @escaping (_ cursor: String, _ pattern: String?) async throws -> ValuePage<Element>) {
         self.supportsSearch = supportsSearch
         self.report = report
+        self.formattedValues = formattedValues
         self.fetch = fetch
     }
 
@@ -211,6 +219,9 @@ final class CollectionPager<Element: Identifiable & Sendable> {
             }
             elements.append(contentsOf: collected)
             next = cursor
+            if !hasFormat, !collected.isEmpty {
+                format = ValueFormatter.detect(elements: collected.prefix(32).flatMap(formattedValues))
+            }
         } catch {
             report(error)
             next = nil
@@ -258,7 +269,12 @@ final class StringValueModel {
     var isDirty: Bool { text != rendered() }
     var canEdit: Bool { format.isEditable && !isTruncated }
 
-    func rendered() -> String { ValueFormatter.render(bytes, as: format) }
+    func rendered() -> String {
+        if format == .messagePack, isTruncated, !MessagePack.isSingleValue(bytes) {
+            return String(localized: "MessagePack is decoded from the whole value, and only the first \(Int64(Self.previewLimit).byteSize) is loaded. Click Load Full Value to decode it.")
+        }
+        return ValueFormatter.render(bytes, as: format)
+    }
 
     func load(full: Bool = false) async {
         isLoading = true
@@ -304,7 +320,7 @@ final class HashValueModel {
         self.supportsFieldTTL = supportsFieldTTL
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: true, report: report) { cursor, pattern in
+        pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.value] }) { cursor, pattern in
             try await ops.hashPage(key, cursor: cursor, match: pattern, count: 200, withFieldTTL: supportsFieldTTL)
         }
     }
@@ -348,7 +364,7 @@ final class ListValueModel {
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: false, report: report) { cursor, _ in
+        pager = CollectionPager(supportsSearch: false, report: report, formattedValues: { [$0.value] }) { cursor, _ in
             let start = Int(cursor) ?? 0
             let entries = try await ops.listRange(key, start: start, count: 200)
             return ValuePage(elements: entries, next: entries.count == 200 ? String(start + entries.count) : nil)
@@ -395,7 +411,7 @@ final class SetValueModel {
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: true, report: report) { cursor, pattern in
+        pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.value] }) { cursor, pattern in
             let page = try await ops.setPage(key, cursor: cursor, match: pattern, count: 200)
             return ValuePage(elements: page.elements.map(SetMember.init), next: page.next)
         }
@@ -426,7 +442,13 @@ final class SortedSetValueModel {
     let ops: KeyOperations
     private(set) var pager: CollectionPager<SortedSetEntry>
     var descending = false {
-        didSet { if oldValue != descending { pager = makePager(); Task { await reload() } } }
+        didSet {
+            guard oldValue != descending else { return }
+            let previous = pager
+            pager = makePager()
+            if previous.hasFormat { pager.format = previous.format }
+            Task { await reload() }
+        }
     }
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
@@ -436,13 +458,13 @@ final class SortedSetValueModel {
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: true, report: report) { _, _ in ValuePage(elements: [], next: nil) }
+        pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { _ in [] }) { _, _ in ValuePage(elements: [], next: nil) }
         pager = makePager()
     }
 
     private func makePager() -> CollectionPager<SortedSetEntry> {
         let (key, ops, descending) = (self.key, self.ops, self.descending)
-        return CollectionPager(supportsSearch: true, report: report) { cursor, pattern in
+        return CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.member] }) { cursor, pattern in
             if let pattern {
                 return try await ops.sortedSetPage(key, cursor: cursor, match: pattern, count: 200)
             }
@@ -486,7 +508,7 @@ final class StreamValueModel {
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: false, report: report) { cursor, _ in
+        pager = CollectionPager(supportsSearch: false, report: report, formattedValues: { $0.fields.map(\.value) }) { cursor, _ in
             try await ops.streamPage(key, before: cursor == "0" ? nil : cursor, count: 200)
         }
     }

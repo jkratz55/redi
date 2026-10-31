@@ -4,6 +4,7 @@ import Foundation
 public enum ValueFormat: String, CaseIterable, Sendable, Codable, Identifiable {
     case text
     case json
+    case messagePack
     case ascii
     case hex
     case binary
@@ -15,6 +16,7 @@ public enum ValueFormat: String, CaseIterable, Sendable, Codable, Identifiable {
         switch self {
         case .text: "Unicode"
         case .json: "JSON"
+        case .messagePack: "MessagePack"
         case .ascii: "ASCII"
         case .hex: "HEX"
         case .binary: "Binary"
@@ -26,7 +28,7 @@ public enum ValueFormat: String, CaseIterable, Sendable, Codable, Identifiable {
     public var isEditable: Bool {
         switch self {
         case .text, .json, .ascii, .hex: true
-        case .binary, .float32Vector: false
+        case .messagePack, .binary, .float32Vector: false
         }
     }
 }
@@ -46,16 +48,66 @@ public enum ValueFormatter {
         }
     }
 
-    /// The best initial format: JSON for JSON documents, Unicode for valid UTF-8 text, HEX otherwise.
+    /// The best initial format: JSON for JSON documents, Unicode for valid UTF-8 text, MessagePack for
+    /// a MessagePack map or array, HEX otherwise.
     public static func detect(_ bytes: some Collection<UInt8>) -> ValueFormat {
         guard !bytes.isEmpty else { return .text }
-        guard isText(bytes) else { return .hex }
+        guard isText(bytes) else { return MessagePack.isDocument(bytes) ? .messagePack : .hex }
         if let first = bytes.first(where: { !isWhitespace($0) }),
            first == UInt8(ascii: "{") || first == UInt8(ascii: "["),
            (try? JSONSerialization.jsonObject(with: Data(bytes), options: [.fragmentsAllowed])) != nil {
             return .json
         }
         return .text
+    }
+
+    /// The best initial format for a collection's values (hash values, list elements, members…):
+    /// MessagePack when a sample of them is MessagePack, Unicode otherwise. Text values are skipped,
+    /// so a hash mixing plain fields with MessagePack ones still counts.
+    public static func detect(elements values: some Sequence<[UInt8]>) -> ValueFormat {
+        var sawDocument = false
+        for value in values.prefix(32) where !value.isEmpty && !isText(value.prefix(256)) {
+            guard MessagePack.isSingleValue(value) else { return .text }
+            if MessagePack.isContainerMarker(value[0]) { sawDocument = true }
+        }
+        return sawDocument ? .messagePack : .text
+    }
+
+    /// MessagePack text for one collection element, or `nil` when it should show as it is: when it's
+    /// printable text (a lone digit is also a MessagePack integer, but far more likely text) or isn't
+    /// exactly one MessagePack value.
+    public static func messagePackElement(_ bytes: some Collection<UInt8>, style: MessagePack.Style = .pretty,
+                                          limit: Int = .max) -> String? {
+        guard !bytes.isEmpty, !isText(bytes.prefix(256)) else { return nil }
+        return try? MessagePack.render(bytes, style: style, single: true, limit: limit)
+    }
+
+    /// One line of text for a table cell showing a collection element in `format`.
+    public static func cellText(_ bytes: [UInt8], as format: ValueFormat, limit: Int = 4096) -> String {
+        let more = bytes.count > limit ? "…" : ""
+        switch format {
+        case .text, .json:
+            return preview(bytes, limit: limit)
+        case .messagePack:
+            return messagePackElement(bytes, style: .compact, limit: limit) ?? preview(bytes, limit: limit)
+        case .ascii:
+            return escaped(bytes.prefix(limit)) + more
+        case .hex:
+            return bytes.prefix(limit / 3).map { String(format: "%02x", $0) }.joined(separator: " ") + (bytes.count > limit / 3 ? "…" : "")
+        case .binary, .float32Vector:
+            let prefix = Array(bytes.prefix(limit / 9 / 4 * 4))
+            guard format == .binary || bytes.count % 4 == 0 else { return render(bytes, as: format) }
+            return render(prefix, as: format) + (bytes.count > prefix.count ? "…" : "")
+        }
+    }
+
+    /// The full text of a collection element in `format`, for copying and viewing.
+    public static func elementText(_ bytes: [UInt8], as format: ValueFormat) -> String {
+        switch format {
+        case .text: String(decoding: bytes, as: UTF8.self)
+        case .messagePack: messagePackElement(bytes) ?? String(decoding: bytes, as: UTF8.self)
+        default: render(bytes, as: format)
+        }
     }
 
     /// Valid UTF-8 without control characters other than tab/newline/carriage return.
@@ -70,6 +122,8 @@ public enum ValueFormatter {
         switch format {
         case .text: return String(decoding: slice, as: UTF8.self)
         case .json: return prettyJSON(String(decoding: slice, as: UTF8.self))
+        case .messagePack:
+            do { return try MessagePack.render(slice) } catch { return String(describing: error) }
         case .ascii: return escaped(slice)
         case .hex: return hexDump(slice)
         case .binary: return slice.map { byte in
@@ -125,7 +179,7 @@ public enum ValueFormatter {
                 index = next
             }
             return bytes
-        case .binary, .float32Vector:
+        case .messagePack, .binary, .float32Vector:
             return Array(text.utf8)
         }
     }

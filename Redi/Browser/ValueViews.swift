@@ -10,10 +10,7 @@ struct StringValueView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Picker("Format", selection: $model.format) {
-                    ForEach(ValueFormat.allCases) { Text($0.displayName).tag($0) }
-                }
-                .fixedSize()
+                FormatPicker(selection: $model.format)
                 if model.isTruncated {
                     Label("Showing the first \(Int64(StringValueModel.previewLimit).byteSize)", systemImage: "scissors")
                         .font(.callout).foregroundStyle(.secondary)
@@ -71,13 +68,13 @@ struct HashValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
                 Button("Add Field", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Delete", systemImage: "minus") { delete(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
             Table(pager.elements, selection: $selection) {
                 TableColumn("Field") { Text($0.field.displayText).font(.body.monospaced()).lineLimit(1) }
-                TableColumn("Value") { Text($0.value.displayText).font(.body.monospaced()).lineLimit(1) }
+                TableColumn("Value") { Text(ValueFormatter.cellText($0.value, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
                 if model.supportsFieldTTL {
                     TableColumn("TTL") { entry in
                         Text(entry.ttl.map { ($0 * 1000).ttlDescription } ?? "∞").foregroundStyle(.secondary).monospacedDigit()
@@ -103,7 +100,7 @@ struct HashValueView: View {
         .sheet(item: $editing) { entry in
             ElementEditorSheet(title: "Edit Field",
                                fields: [.init(label: "Field", value: BinaryText(entry.field), isEditable: false),
-                                        .init(label: "Value", value: BinaryText(entry.value), isMultiline: true)],
+                                        .init(label: "Value", value: BinaryText(entry.value, format: model.pager.format), isMultiline: true)],
                                extraLabel: model.supportsFieldTTL ? "Field TTL (seconds)" : nil,
                                extra: entry.ttl.map(String.init) ?? "", extraPrompt: "No expiry") { values, ttl in
                 await model.set(field: entry.field, value: values[1], ttl: model.supportsFieldTTL ? (Int64(ttl) ?? 0) : nil)
@@ -119,7 +116,8 @@ struct HashValueView: View {
     }
 
     private func copy(_ ids: Set<HashEntry.ID>) {
-        let text = model.pager.elements.filter { ids.contains($0.id) }.map { String(decoding: $0.value, as: UTF8.self) }.joined(separator: "\n")
+        let format = model.pager.format
+        let text = model.pager.elements.filter { ids.contains($0.id) }.map { ValueFormatter.elementText($0.value, as: format) }.joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -141,9 +139,9 @@ struct ListValueView: View {
     @State private var addingAtHead: Bool?
 
     var body: some View {
-        let pager = model.pager
+        @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: .constant(""), supportsSearch: false, onSearch: {}) {
+            CollectionToolbar(search: .constant(""), supportsSearch: false, format: $pager.format, onSearch: {}) {
                 Menu {
                     Button("Insert at Head (LPUSH)") { addingAtHead = true }
                     Button("Append to Tail (RPUSH)") { addingAtHead = false }
@@ -157,7 +155,7 @@ struct ListValueView: View {
             Table(pager.elements, selection: $selection) {
                 TableColumn("Index") { Text($0.index, format: .number).foregroundStyle(.secondary).monospacedDigit() }
                     .width(70)
-                TableColumn("Element") { Text($0.value.displayText).font(.body.monospaced()).lineLimit(1) }
+                TableColumn("Element") { Text(ValueFormatter.cellText($0.value, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
             }
             .contextMenu(forSelectionType: ListEntry.ID.self) { ids in
                 if !isReadOnly, ids.count == 1 {
@@ -174,7 +172,7 @@ struct ListValueView: View {
         }
         .sheet(item: $editing) { entry in
             ElementEditorSheet(title: "Edit Element \(entry.index)",
-                               fields: [.init(label: "Element", value: BinaryText(entry.value), isMultiline: true)]) { values, _ in
+                               fields: [.init(label: "Element", value: BinaryText(entry.value, format: model.pager.format), isMultiline: true)]) { values, _ in
                 await model.set(index: entry.index, value: values[0])
             }
         }
@@ -205,17 +203,18 @@ struct SetValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
                 Button("Add Member", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Remove", systemImage: "minus") { remove(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
             Table(pager.elements, selection: $selection) {
-                TableColumn("Member") { Text($0.value.displayText).font(.body.monospaced()).lineLimit(1) }
+                TableColumn("Member") { Text(ValueFormatter.cellText($0.value, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
             }
             .contextMenu(forSelectionType: SetMember.ID.self) { ids in
                 Button("Copy") {
+                    let format = pager.format
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(ids.map { String(decoding: $0, as: UTF8.self) }.joined(separator: "\n"), forType: .string)
+                    NSPasteboard.general.setString(ids.map { ValueFormatter.elementText($0, as: format) }.joined(separator: "\n"), forType: .string)
                 }
                 if !isReadOnly { Button("Remove", role: .destructive) { remove(ids) } }
             }
@@ -250,7 +249,7 @@ struct SortedSetValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
                 Picker("Order", selection: $model.descending) {
                     Text("Lowest First").tag(false)
                     Text("Highest First").tag(true)
@@ -262,7 +261,7 @@ struct SortedSetValueView: View {
             }
             Table(pager.elements, selection: $selection) {
                 TableColumn("Score") { Text($0.score, format: .number).monospacedDigit() }.width(110)
-                TableColumn("Member") { Text($0.member.displayText).font(.body.monospaced()).lineLimit(1) }
+                TableColumn("Member") { Text(ValueFormatter.cellText($0.member, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
             }
             .contextMenu(forSelectionType: SortedSetEntry.ID.self) { ids in
                 if !isReadOnly {
@@ -278,7 +277,7 @@ struct SortedSetValueView: View {
             }
         }
         .sheet(item: $editing) { entry in
-            ElementEditorSheet(title: "Edit Score", fields: [.init(label: "Member", value: BinaryText(entry.member), isEditable: false)],
+            ElementEditorSheet(title: "Edit Score", fields: [.init(label: "Member", value: BinaryText(entry.member, format: model.pager.format, style: .compact), isEditable: false)],
                                extraLabel: "Score", extra: String(entry.score)) { _, score in
                 if let value = Double(score) { await model.add(member: entry.member, score: value) }
             }
@@ -310,6 +309,7 @@ struct StreamValueView: View {
     @State private var isCreatingGroup = false
 
     var body: some View {
+        @Bindable var pager = model.pager
         VStack(spacing: 0) {
             HStack {
                 Picker("View", selection: $tab) {
@@ -319,6 +319,7 @@ struct StreamValueView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
+                if tab == 0 { FormatPicker(selection: $pager.format) }
                 Spacer()
                 if tab == 0 {
                     Button("Add Entry", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
@@ -363,7 +364,7 @@ struct StreamValueView: View {
                 .width(min: 120, ideal: 150)
                 TableColumnForEach(columns, id: \.self) { name in
                     TableColumn(name) { entry in
-                        Text(entry.fields.first { $0.name.displayText == name }?.value.displayText ?? "")
+                        Text(entry.fields.first { $0.name.displayText == name }.map { ValueFormatter.cellText($0.value, as: pager.format) } ?? "")
                             .font(.body.monospaced()).lineLimit(1)
                     }
                 }

@@ -26,6 +26,8 @@ XADD ui:stream 2-1 type updated user 43
 SET ui:string "hello world"
 SET ui:json-string "{\"name\":\"Redi\",\"tags\":[\"fast\",\"native\"]}"
 SET ui:expiring soon EX 3600
+SET ui:msgpack "\x85\xa4name\xa3Ada\xa3age$\xa5admin\xc3\xa4tags\x92\xa4math\xa4code\xa7created\xd6\xffeS\xf1\x00"
+HSET ui:msgpack-hash item-1 "\x83\xa3sku\xa3A-1\xa3qty\x02\xa5price\xcb@#\xfa\xe1G\xae\x14{" item-2 "\x83\xa3sku\xa3B-7\xa3qty\x01\xa5price\xcb@8\x80\x00\x00\x00\x00\x00" note "plain text"
 EOF
 for i in $(seq 1 200); do echo "SET ui:bulk:$i v$i"; done | redis-cli -p "$PORT" >/dev/null
 
