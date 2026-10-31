@@ -351,7 +351,8 @@ struct BulkDeleteSheet: View {
             case .done:
                 Label("Deleted \(deleted.formatted()) keys.", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
             case .failed(let message):
-                Label(message, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                Label("Stopped after deleting \(deleted.formatted()) keys: \(message)", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
             }
             HStack {
                 Spacer()

@@ -108,11 +108,54 @@ public struct ValuePage<Element: Sendable>: Sendable {
 }
 
 /// Reads and writes key values. All calls go through the session's interactive connection.
+/// Failures that come from Redi's own safety checks rather than from a server error reply.
+public enum KeyOperationError: Error, Sendable, Hashable, CustomStringConvertible {
+    /// Creating would have overwritten an existing key.
+    case keyExists(String)
+    /// A list element changed (or moved) since it was loaded, so it wasn't removed.
+    case listChanged(String)
+    /// Undo needs the database the key was deleted from.
+    case restoreNeedsDatabase(key: String, database: Int)
+    /// The key was created again after it was deleted, so undo didn't overwrite it.
+    case restoreConflict(String)
+    /// The key's TTL ran out after it was deleted, so there's nothing to restore.
+    case restoreExpired(String)
+
+    public var description: String {
+        switch self {
+        case .keyExists(let key): "A key named “\(key)” already exists."
+        case .listChanged(let key): "“\(key)” changed since it was loaded, so nothing was removed. Reload it and try again."
+        case .restoreNeedsDatabase(let key, let database): "“\(key)” was deleted from db\(database). Switch to db\(database) to undo."
+        case .restoreConflict(let key): "“\(key)” was created again after it was deleted, so it wasn't restored."
+        case .restoreExpired(let key): "“\(key)” would have expired by now, so it wasn't restored."
+        }
+    }
+}
+
 public struct KeyOperations: Sendable {
     public let session: RedisSession
 
     public init(session: RedisSession) {
         self.session = session
+    }
+
+    /// Whether an error reply means the server doesn't have `command` (too old, renamed or disabled).
+    static func isUnknownCommand(_ error: RedisServerError, _ command: String) -> Bool {
+        let message = error.message.lowercased()
+        let name = command.lowercased()
+        return message.contains("unknown command '\(name)'") || message.contains("unknown command `\(name)`")
+    }
+
+    /// Runs a Lua script on one key. Returns `nil` when the server won't run scripts (EVAL unknown or
+    /// denied by ACL), so the caller can fall back to separate commands. Other error replies are
+    /// returned as values.
+    func evalIfAvailable(_ script: String, key: [UInt8], arguments: [any RESPArgumentConvertible]) async throws -> RESPValue? {
+        let reply = try await session.send(RedisCommand("EVAL", [script, 1, key] as [any RESPArgumentConvertible] + arguments))
+        if let error = reply.serverError {
+            let deniedScripting = error.code == "NOPERM" && error.message.lowercased().contains("'eval'")
+            if Self.isUnknownCommand(error, "eval") || deniedScripting { return nil }
+        }
+        return reply
     }
 
     // MARK: - Key-level
@@ -168,7 +211,8 @@ public struct KeyOperations: Sendable {
         var total = 0
         for key in keys {
             let reply = try await session.send(RedisCommand("UNLINK", key))
-            if reply.serverError != nil {
+            if let error = reply.serverError {
+                guard Self.isUnknownCommand(error, "unlink") else { throw error }
                 total += Int(try await session.execute(RedisCommand("DEL", key)).int ?? 0)
             } else {
                 total += Int(reply.int ?? 0)
@@ -177,21 +221,43 @@ public struct KeyOperations: Sendable {
         return total
     }
 
-    /// A serialized copy of a key for undo: `DUMP` payload plus remaining TTL.
+    /// A serialized copy of a key for undo: the `DUMP` payload, its expiry and its database.
     public struct Snapshot: Sendable {
         public var key: [UInt8]
         public var payload: [UInt8]
-        public var ttl: Int64
+        /// When the key would expire, or `nil` if it doesn't. Measured on this Mac's monotonic clock,
+        /// so a delayed undo restores only the time that's left, whatever the server's clock says.
+        public var expiresAt: ContinuousClock.Instant?
+        /// The database the key was in (always 0 in a cluster).
+        public var database: Int
     }
 
     public func snapshot(_ key: [UInt8]) async throws -> Snapshot? {
+        let database = await session.database
+        let taken = ContinuousClock.now
         let replies = try await session.pipeline([RedisCommand("DUMP", key), RedisCommand("PTTL", key)])
         guard let payload = replies[0].bytes else { return nil }
-        return Snapshot(key: key, payload: payload, ttl: max(0, replies[1].int ?? 0))
+        let ttl = replies[1].int ?? -1
+        return Snapshot(key: key, payload: payload, expiresAt: ttl > 0 ? taken + .milliseconds(ttl) : nil, database: database)
     }
 
+    /// Restores a deleted key into its original database with the TTL it has left. Never overwrites:
+    /// a key created again since the snapshot is reported as a conflict.
     public func restore(_ snapshot: Snapshot) async throws {
-        try await session.execute(RedisCommand("RESTORE", snapshot.key, snapshot.ttl, snapshot.payload, "REPLACE"))
+        let name = String(decoding: snapshot.key, as: UTF8.self)
+        guard await session.database == snapshot.database else {
+            throw KeyOperationError.restoreNeedsDatabase(key: name, database: snapshot.database)
+        }
+        var ttl: Int64 = 0
+        if let expiresAt = snapshot.expiresAt {
+            let remaining = (expiresAt - .now).components
+            ttl = remaining.seconds * 1000 + remaining.attoseconds / 1_000_000_000_000_000
+            guard ttl > 0 else { throw KeyOperationError.restoreExpired(name) }
+        }
+        let reply = try await session.send(RedisCommand("RESTORE", snapshot.key, ttl, snapshot.payload))
+        if let error = reply.serverError {
+            throw error.code == "BUSYKEY" ? KeyOperationError.restoreConflict(name) : error
+        }
     }
 
     // MARK: - Strings
@@ -271,10 +337,28 @@ public struct KeyOperations: Sendable {
         try await session.execute(RedisCommand(arguments: [Array((atHead ? "LPUSH" : "RPUSH").utf8), key] + values))
     }
 
-    /// Removes the element at `index` with the standard placeholder trick (LSET to a unique
-    /// sentinel, then LREM it), since Redis has no remove-by-index.
-    public func removeListElement(_ key: [UInt8], index: Int) async throws {
+    /// LSETs the element to a unique placeholder and LREMs it (Redis has no remove-by-index), but
+    /// only if it still holds the expected value. Atomic, so the placeholder can't be left behind.
+    static let removeListElementScript = """
+        if redis.call('LINDEX', KEYS[1], ARGV[1]) ~= ARGV[2] then return 0 end
+        redis.call('LSET', KEYS[1], ARGV[1], ARGV[3])
+        redis.call('LREM', KEYS[1], 1, ARGV[3])
+        return 1
+        """
+
+    /// Removes the element at `index`, provided it still holds `expected`. Another client may have
+    /// pushed or popped since the list was loaded, moving a different element to `index`; in that
+    /// case nothing is removed and `KeyOperationError.listChanged` is thrown.
+    public func removeListElement(_ key: [UInt8], index: Int, expected: [UInt8]) async throws {
         let placeholder = Array("__redi_deleted_\(UUID().uuidString)__".utf8)
+        let changed = KeyOperationError.listChanged(String(decoding: key, as: UTF8.self))
+        if let reply = try await evalIfAvailable(Self.removeListElementScript, key: key, arguments: [index, expected, placeholder]) {
+            if try reply.throwIfError().int != 1 { throw changed }
+            return
+        }
+        // Without scripting: check, then LSET + LREM. Not atomic, but only a change in between can
+        // make it remove the wrong element.
+        guard try await session.execute(RedisCommand("LINDEX", key, index)).bytes == expected else { throw changed }
         _ = try await session.pipeline([RedisCommand("LSET", key, index, placeholder), RedisCommand("LREM", key, 1, placeholder)])
             .map { try $0.throwIfError() }
     }
@@ -446,27 +530,50 @@ public struct KeyOperations: Sendable {
         case json(String)
     }
 
-    /// Creates a key. Fails if it already exists, so nothing is overwritten by accident.
+    /// Creates the key with the command in ARGV[2...] (key omitted) and an optional TTL in ARGV[1],
+    /// unless it already exists. Atomic, so a key another client creates meanwhile isn't touched.
+    static let createScript = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+        redis.call(ARGV[2], KEYS[1], unpack(ARGV, 3))
+        if tonumber(ARGV[1]) > 0 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+        return 1
+        """
+
+    /// Creates a key. Fails with `KeyOperationError.keyExists` if it already exists, so nothing is
+    /// overwritten, even when another client creates the same name at the same moment.
     public func create(_ key: [UInt8], value: NewValue, ttlSeconds: Int64?) async throws {
-        if try await session.execute(RedisCommand("EXISTS", key)).int ?? 0 > 0 {
-            throw RedisServerError("ERR A key named “\(String(decoding: key, as: UTF8.self))” already exists.")
-        }
+        let ttl = ttlSeconds.flatMap { $0 > 0 ? $0 : nil }
+        let exists = KeyOperationError.keyExists(String(decoding: key, as: UTF8.self))
+        let (name, arguments): (String, [any RESPArgumentConvertible])
         switch value {
-        case .string(let bytes): try await session.execute(RedisCommand("SET", key, bytes))
-        case .hash(let field, let value): try await setHashField(key, field: field, value: value)
-        case .list(let element): try await pushList(key, values: [element], atHead: false)
-        case .set(let member): try await addSetMembers(key, members: [member])
-        case .sortedSet(let member, let score): try await addSortedSetMember(key, member: member, score: score)
-        case .stream(let id, let fields): _ = try await addStreamEntry(key, id: id, fields: fields)
-        case .json(let text): try await setJSON(key, json: text)
+        case .string(let bytes):
+            var command = RedisCommand("SET", key, bytes, "NX")
+            if let ttl { command.append("EX"); command.append(ttl) }
+            if try await session.execute(command).isNull { throw exists }
+            return
+        case .hash(let field, let value): (name, arguments) = ("HSET", [field, value])
+        case .list(let element): (name, arguments) = ("RPUSH", [element])
+        case .set(let member): (name, arguments) = ("SADD", [member])
+        case .sortedSet(let member, let score): (name, arguments) = ("ZADD", [score, member])
+        case .stream(let id, let fields): (name, arguments) = ("XADD", [id.isEmpty ? "*" : id] + fields.flatMap { [$0.name, $0.value] as [any RESPArgumentConvertible] })
+        case .json(let text): (name, arguments) = ("JSON.SET", ["$", text])
         }
-        if let ttlSeconds, ttlSeconds > 0 { try await setTTL(key, seconds: ttlSeconds) }
+        if let reply = try await evalIfAvailable(Self.createScript, key: key, arguments: [ttl ?? 0, name] + arguments) {
+            if try reply.throwIfError().int != 1 { throw exists }
+            return
+        }
+        // Without scripting: check, then create. Another client could create the key in between.
+        if try await session.execute(RedisCommand("EXISTS", key)).int ?? 0 > 0 { throw exists }
+        try await session.execute(RedisCommand(name, [key as any RESPArgumentConvertible] + arguments))
+        if let ttl { try await setTTL(key, seconds: ttl) }
     }
 
     // MARK: - Bulk
 
     /// Deletes every key matching `filter`, yielding the running total. Uses the background
-    /// connection and UNLINK in batches so the server stays responsive.
+    /// connection and UNLINK in batches so the server stays responsive (DEL on servers without
+    /// UNLINK). The first error reply (e.g. NOPERM) ends the stream with that error, after yielding
+    /// the keys deleted so far.
     public func bulkDelete(filter: ScanFilter, batchSize: Int = 500) -> AsyncThrowingStream<Int, any Error> {
         let session = self.session
         return AsyncThrowingStream { continuation in
@@ -475,15 +582,28 @@ public struct KeyOperations: Sendable {
                     let scanner = await KeyScanner(session: session)
                     var cursor = ScanCursor()
                     var deleted = 0
+                    var command = "UNLINK"
                     while !cursor.isComplete {
                         try Task.checkCancellation()
                         let result = try await scanner.next(from: cursor, filter: filter, count: batchSize, target: batchSize)
                         cursor = result.cursor
-                        if !result.keys.isEmpty {
-                            let replies = try await session.pipeline(result.keys.map { RedisCommand("UNLINK", $0) }, role: .background)
-                            deleted += replies.reduce(0) { $0 + Int($1.int ?? 0) }
-                            continuation.yield(deleted)
+                        guard !result.keys.isEmpty else { continue }
+                        var replies = try await session.pipeline(result.keys.map { RedisCommand(command, $0) }, role: .background)
+                        if command == "UNLINK", let error = replies.lazy.compactMap(\.serverError).first,
+                           Self.isUnknownCommand(error, "unlink") {
+                            command = "DEL"
+                            replies = try await session.pipeline(result.keys.map { RedisCommand(command, $0) }, role: .background)
                         }
+                        var failure: RedisServerError?
+                        for reply in replies {
+                            if let error = reply.serverError {
+                                failure = failure ?? error
+                            } else {
+                                deleted += Int(reply.int ?? 0)
+                            }
+                        }
+                        continuation.yield(deleted)
+                        if let failure { throw failure }
                     }
                     continuation.finish()
                 } catch {

@@ -59,6 +59,24 @@ struct ClusterLiveTests {
         await session.close()
     }
 
+    @Test("Script-backed key operations reach the node that owns the key")
+    func scriptedOperations() async throws {
+        let session = session()
+        try await session.open()
+        let ops = KeyOperations(session: session)
+        // Hash tags put these in different slots, so on different primaries.
+        let keys = (0..<6).map { Array("redi:test:{n\($0)}:list".utf8) }
+        for key in keys {
+            try await ops.create(key, value: .list(Array("a".utf8)), ttlSeconds: 60)
+            await #expect(throws: KeyOperationError.self) { try await ops.create(key, value: .list(Array("b".utf8)), ttlSeconds: nil) }
+            try await ops.pushList(key, values: [Array("b".utf8)], atHead: false)
+            try await ops.removeListElement(key, index: 0, expected: Array("a".utf8))
+            #expect(try await ops.listRange(key, start: 0, count: 10).map(\.value) == [Array("b".utf8)])
+        }
+        try await ops.delete(keys)
+        await session.close()
+    }
+
     @Test("Fans out keyless commands to every primary")
     func fanOut() async throws {
         let session = session()

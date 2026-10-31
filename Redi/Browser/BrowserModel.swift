@@ -49,6 +49,8 @@ final class BrowserModel {
     @ObservationIgnored private var pendingMetadata = Set<Int>()
     @ObservationIgnored private var metadataTask: Task<Void, Never>?
     @ObservationIgnored private var scanner: KeyScanner?
+    /// The window's undo manager, once a delete has registered an undo with it.
+    @ObservationIgnored private weak var undoManager: UndoManager?
     @ObservationIgnored private let signposter = OSSignposter(subsystem: "com.github.jkratz55.Redi", category: "Browser")
 
     init(workspace: WorkspaceModel) {
@@ -287,21 +289,35 @@ final class BrowserModel {
     }
 
     private func registerUndo(_ snapshots: [KeyOperations.Snapshot], undoManager: UndoManager) {
+        self.undoManager = undoManager
         undoManager.registerUndo(withTarget: self) { model in
             Task {
                 guard let session = model.session else { return }
                 let ops = KeyOperations(session: session)
-                do {
-                    for snapshot in snapshots {
+                // Restore each key on its own, so one conflict doesn't stop the rest.
+                var failures: [String] = []
+                for snapshot in snapshots {
+                    do {
                         try await ops.restore(snapshot)
                         model.markRestored(snapshot.key)
+                    } catch {
+                        failures.append(String(describing: error))
                     }
-                } catch {
-                    model.workspace.show(notice: String(describing: error))
+                }
+                if let first = failures.first {
+                    model.workspace.show(notice: failures.count == 1 ? first
+                        : String(localized: "\(first) (and \(failures.count - 1) more)"))
                 }
             }
         }
         undoManager.setActionName(snapshots.count == 1 ? String(localized: "Delete Key") : String(localized: "Delete Keys"))
+    }
+
+    /// Called after switching databases. Pending delete undos belong to the old database, so they're
+    /// dropped rather than left to fail (`KeyOperations.restore` also refuses another database).
+    func databaseDidChange() {
+        undoManager?.removeAllActions(withTarget: self)
+        reload()
     }
 
     func copyName(rows: [Int]) {

@@ -169,7 +169,7 @@ final class WorkspaceModel {
         do {
             try await session.select(database: index)
             database = index
-            browserModel?.reload()
+            browserModel?.databaseDidChange()
         } catch {
             show(notice: String(describing: error))
         }

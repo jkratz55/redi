@@ -388,7 +388,8 @@ final class ListValueModel {
     }
 
     func remove(index: Int) async {
-        await perform(report, onChange) { try await ops.removeListElement(key, index: index) }
+        guard let expected = pager.elements.first(where: { $0.index == index })?.value else { return }
+        await perform(report, onChange) { try await ops.removeListElement(key, index: index, expected: expected) }
         await reload()
     }
 }
