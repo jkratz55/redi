@@ -1,0 +1,19 @@
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcresult
+
+# Swift Package Manager
+Packages/RediKit/.build/
+Packages/RediKit/.swiftpm/
+.build/
+.swiftpm/
+
+# Local dev servers, generated certificates and seed data (Scripts/dev-redis.sh, gen-tls-certs.sh)
+.dev-redis/
+
+# macOS
+.DS_Store
+
+# Release output (Scripts/release.sh)
+dist/

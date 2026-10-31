@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Merged into the generated Info.plist. Values come from build settings in the project. -->
+	<key>SUFeedURL</key>
+	<string>$(REDI_APPCAST_URL)</string>
+	<key>SUPublicEDKey</key>
+	<string>$(REDI_SPARKLE_PUBLIC_KEY)</string>
+	<key>SUEnableInstallerLauncherService</key>
+	<false/>
+</dict>
+</plist>

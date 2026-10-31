@@ -1,0 +1,48 @@
+# Servers that the Homebrew redis-server can't provide. Local topologies (standalone, cluster,
+# sentinel, TLS) live in Scripts/dev-redis.sh.
+#
+#   docker compose -f Scripts/docker-compose.yml up -d
+#
+#   redis8        localhost:6385  Redis 8 with bundled modules (JSON, Search, TimeSeries, Bloom)
+#   redis62       localhost:6386  Redis 6.2: RESP3 without COMMAND DOCS, older reply shapes
+#   redis5        localhost:6387  Redis 5: no HELLO, no ACLs (exercises the RESP2 fallback)
+#   valkey        localhost:6388  Valkey 8
+#   ssh-bastion   localhost:2222  user "redi", password "redi". Reaches "redis-private:6379",
+#                                 which isn't published, so only an SSH tunnel can get to it.
+name: redi-dev
+
+services:
+  redis8:
+    image: redis:8
+    ports: ["127.0.0.1:6385:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  redis62:
+    image: redis:6.2
+    ports: ["127.0.0.1:6386:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  redis5:
+    image: redis:5
+    ports: ["127.0.0.1:6387:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "legacy"]
+
+  valkey:
+    image: valkey/valkey:8
+    ports: ["127.0.0.1:6388:6379"]
+    command: ["valkey-server", "--save", "", "--appendonly", "no"]
+
+  redis-private:
+    image: redis:8
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--requirepass", "tunnel"]
+
+  ssh-bastion:
+    image: linuxserver/openssh-server:latest
+    ports: ["127.0.0.1:2222:2222"]
+    environment:
+      USER_NAME: redi
+      USER_PASSWORD: redi
+      PASSWORD_ACCESS: "true"
+      # Allow -L forwarding to redis-private.
+      DOCKER_MODS: linuxserver/mods:openssh-server-ssh-tunnel
+    depends_on: [redis-private]
