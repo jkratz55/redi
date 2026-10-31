@@ -43,6 +43,9 @@ final class BrowserModel {
 
     @ObservationIgnored private unowned let workspace: WorkspaceModel
     @ObservationIgnored private var cursor = ScanCursor()
+    /// Bumped by `reload` (new filter, database or refresh). Row numbers from an older generation
+    /// refer to different keys, so scan and metadata results from one are dropped.
+    @ObservationIgnored private var generation = 0
     @ObservationIgnored private var deduplicator = KeyDeduplicator()
     @ObservationIgnored private var scanTask: Task<Void, Never>?
     @ObservationIgnored private var metadata: [Int: KeyMetadata] = [:]
@@ -73,6 +76,7 @@ final class BrowserModel {
 
     /// Clears everything and loads the first page with the current filter.
     func reload() {
+        generation += 1
         scanTask?.cancel()
         metadataTask?.cancel()
         index = KeyIndex()
@@ -115,8 +119,10 @@ final class BrowserModel {
         isScanning = true
         let filter = appliedFilter
         let count = max(scanCount, 100)
+        let scanning = generation
         scanTask = Task { [weak self] in
-            defer { self?.isScanning = false }
+            // After a reload, `isScanning` belongs to the new scan.
+            defer { if let self, self.generation == scanning { self.isScanning = false } }
             do {
                 guard let self else { return }
                 let scanner: KeyScanner
@@ -127,27 +133,32 @@ final class BrowserModel {
                     self.scanner = scanner
                 }
                 if self.databaseSize == nil || lookupExact {
-                    self.databaseSize = try? await scanner.databaseSize()
+                    let size = try? await scanner.databaseSize()
+                    guard self.generation == scanning else { return }
+                    self.databaseSize = size
                 }
                 if lookupExact, let exact = filter.exactKey, let type = try await scanner.lookup(exactKey: exact, type: filter.type) {
+                    guard self.generation == scanning else { return }
                     self.append(keys: [Array(exact.utf8)], type: type)
                 }
                 var collected = 0
-                while !Task.isCancelled, !self.cursor.isComplete, collected < target {
+                while self.generation == scanning, !Task.isCancelled, !self.cursor.isComplete, collected < target {
                     let state = self.signposter.beginInterval("ScanPage")
                     let result = try await scanner.next(from: self.cursor, filter: filter, count: count,
                                                         target: min(target - collected, count * 4), maxIterations: 20)
                     self.signposter.endInterval("ScanPage", state)
-                    guard !Task.isCancelled else { break }
+                    guard self.generation == scanning, !Task.isCancelled else { break }
                     self.cursor = result.cursor
                     self.approximateScanned += result.iterations * count
                     collected += self.append(keys: result.keys, type: result.type)
                 }
+                guard self.generation == scanning else { return }
                 self.isScanComplete = self.cursor.isComplete
                 if self.isScanComplete, let size = self.databaseSize { self.approximateScanned = size }
             } catch is CancellationError {
             } catch {
-                self?.error = String(describing: error)
+                guard let self, self.generation == scanning else { return }
+                self.error = String(describing: error)
             }
         }
     }
@@ -194,20 +205,20 @@ final class BrowserModel {
         guard !missing.isEmpty, let session else { return }
         pendingMetadata.formUnion(missing)
         let keys = missing.map { Array(index.key(at: $0)) }
-        let revisionAtRequest = keysRevision
+        let requesting = generation
         metadataTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(60))
-            guard let self, !Task.isCancelled, self.keysRevision >= revisionAtRequest else { return }
+            guard let self, !Task.isCancelled, self.generation == requesting else { return }
             let state = self.signposter.beginInterval("Metadata", "\(keys.count) keys")
             defer { self.signposter.endInterval("Metadata", state) }
-            do {
-                let loaded = try await KeyMetadata.load(keys, session: session)
-                for (row, meta) in zip(missing, loaded) { self.metadata[row] = meta }
-                if self.metadata.count > 100_000 {
-                    // Bound memory when someone scrolls through millions of rows.
-                    self.metadata = self.metadata.filter { missing.contains($0.key) }
-                }
-            } catch {}
+            let loaded = try? await KeyMetadata.load(keys, session: session)
+            // Reloaded meanwhile: these row numbers now belong to other keys.
+            guard self.generation == requesting else { return }
+            for (row, meta) in zip(missing, loaded ?? []) { self.metadata[row] = meta }
+            if self.metadata.count > 100_000 {
+                // Bound memory when someone scrolls through millions of rows.
+                self.metadata = self.metadata.filter { missing.contains($0.key) }
+            }
             self.pendingMetadata.subtract(missing)
             self.metadataRevision += 1
         }

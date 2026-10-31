@@ -55,18 +55,47 @@ final class ConnectionStore {
         }
     }
 
-    func save(_ profile: ConnectionProfile, secrets: ConnectionSecrets) {
+    enum SaveError: Error, CustomStringConvertible {
+        case secrets(any Error)
+        case profiles(any Error)
+
+        var description: String {
+            switch self {
+            case .secrets(let error): String(localized: "Couldn't save the connection's secrets to the Keychain: \(String(describing: error))")
+            case .profiles(let error): String(localized: "Couldn't save the connection: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Saves a profile and its secrets, all or nothing. If either can't be stored, the previous
+    /// secrets and profile are put back and the error is thrown, so a profile is never saved
+    /// alongside secrets that didn't change (or changed only partly).
+    func save(_ profile: ConnectionProfile, secrets: ConnectionSecrets) throws {
+        // Empty for a new profile, so restoring it removes anything partly written.
+        let previousSecrets = try? secretStore.secrets(for: profile.id)
         do {
             try secretStore.setSecrets(secrets, for: profile.id)
         } catch {
-            lastError = "Couldn't save secrets to the Keychain: \(error)"
+            restore(previousSecrets, for: profile.id)
+            throw SaveError.secrets(error)
         }
+        let previousProfiles = profiles
         if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
             profiles[index] = profile
         } else {
             profiles.append(profile)
         }
-        persist()
+        do {
+            try repository.save(profiles)
+        } catch {
+            profiles = previousProfiles
+            restore(previousSecrets, for: profile.id)
+            throw SaveError.profiles(error)
+        }
+    }
+
+    private func restore(_ secrets: ConnectionSecrets?, for id: ConnectionProfile.ID) {
+        if let secrets { try? secretStore.setSecrets(secrets, for: id) }
     }
 
     @discardableResult
@@ -77,7 +106,12 @@ final class ConnectionStore {
         copy.name = String(localized: "\(copy.displayName) Copy")
         copy.createdAt = Date()
         copy.lastConnectedAt = nil
-        save(copy, secrets: secrets)
+        do {
+            try save(copy, secrets: secrets)
+        } catch {
+            lastError = String(describing: error)
+            return nil
+        }
         return copy
     }
 
@@ -102,7 +136,7 @@ final class ConnectionStore {
             if let key = item.sshPrivateKey {
                 item.profile.ssh.privateKeyPath = try RedisInsightImport.storePrivateKey(key, for: item.profile.id)
             }
-            save(item.profile, secrets: item.secrets)
+            try save(item.profile, secrets: item.secrets)
         }
         return imported.count
     }

@@ -350,7 +350,13 @@ struct ConnectionEditor: View {
     private func save(connect: Bool) {
         var result = normalized()
         if result.name.trimmingCharacters(in: .whitespaces).isEmpty { result.name = result.address }
-        store.save(result, secrets: secrets)
+        do {
+            try store.save(result, secrets: secrets)
+        } catch {
+            // Stay open with everything entered, so nothing is lost and it can be retried.
+            testState = .failed(String(describing: error))
+            return
+        }
         dismiss()
         onSave(result, connect)
     }

@@ -113,6 +113,7 @@ struct CommandCatalogTests {
         #expect(try classify("config set maxmemory 1") != .normal)
         #expect(try classify("KEYS *") == .expensive(CommandSafety.expensive["keys"]!))
         #expect(try classify("SUBSCRIBE ch") == .streaming(.pubSub))
+        #expect(try classify("UNSUBSCRIBE") == .streaming(.pubSub))
         #expect(try classify("BLPOP q 0") == .blocking)
         #expect(try classify("GET k") == .normal)
         #expect(CommandSafety.isForbiddenInReadOnlyMode(try CommandLineParser.split("SET a b"), table: table))

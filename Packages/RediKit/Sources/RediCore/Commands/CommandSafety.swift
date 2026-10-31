@@ -57,7 +57,8 @@ public enum CommandSafety {
         let sub = arguments.count > 1 ? name + "|" + String(decoding: arguments[1], as: UTF8.self).lowercased() : name
 
         switch name {
-        case "subscribe", "psubscribe", "ssubscribe": return .streaming(.pubSub)
+        // Under RESP3 even the unsubscribe confirmations arrive as pushes, never as a reply.
+        case "subscribe", "psubscribe", "ssubscribe", "unsubscribe", "punsubscribe", "sunsubscribe": return .streaming(.pubSub)
         case "monitor": return .streaming(.monitor)
         default: break
         }

@@ -177,6 +177,8 @@ final class CollectionPager<Element: Identifiable & Sendable> {
     /// The values of an element that `format` applies to, for picking the initial format.
     @ObservationIgnored private let formattedValues: (Element) -> [[UInt8]]
     @ObservationIgnored private(set) var hasFormat = false
+    /// Bumped by `reload`. A load that finds it changed after a fetch was superseded, and drops its page.
+    @ObservationIgnored private var generation = 0
 
     init(supportsSearch: Bool, report: @escaping (any Error) -> Void, formattedValues: @escaping (Element) -> [[UInt8]],
          fetch: @escaping (_ cursor: String, _ pattern: String?) async throws -> ValuePage<Element>) {
@@ -194,16 +196,22 @@ final class CollectionPager<Element: Identifiable & Sendable> {
         return trimmed.contains(where: { "*?[".contains($0) }) ? trimmed : "*\(ScanFilterEscaping.escape(trimmed))*"
     }
 
+    /// Starts over from the first page with the current search. A load still in flight is
+    /// superseded: its results are dropped, and this one runs instead of waiting for it.
     func reload() async {
+        generation += 1
         elements = []
         next = "0"
+        isLoading = false
         await loadMore()
     }
 
     func loadMore() async {
         guard let start = next, !isLoading else { return }
+        let loading = generation
         isLoading = true
-        defer { isLoading = false }
+        // A superseding reload owns `isLoading` now.
+        defer { if generation == loading { isLoading = false } }
         do {
             // A sparse MATCH can return empty pages; keep going until something arrives.
             var cursor: String? = start
@@ -212,6 +220,7 @@ final class CollectionPager<Element: Identifiable & Sendable> {
             let pattern = searchPattern
             while let current = cursor, collected.count < pageSize, rounds < 50 {
                 let page = try await fetch(current, pattern)
+                guard generation == loading else { return }
                 collected.append(contentsOf: page.elements)
                 cursor = page.next
                 rounds += 1
@@ -223,6 +232,7 @@ final class CollectionPager<Element: Identifiable & Sendable> {
                 format = ValueFormatter.detect(elements: collected.prefix(32).flatMap(formattedValues))
             }
         } catch {
+            guard generation == loading else { return }
             report(error)
             next = nil
         }

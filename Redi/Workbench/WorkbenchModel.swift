@@ -69,6 +69,32 @@ final class WorkbenchModel {
         }
     }
 
+    enum Preflight: Equatable {
+        case run
+        case confirm(title: String, message: String)
+        case reject(String)
+    }
+
+    /// Decides whether a batch runs. Streaming commands are always rejected: their replies arrive
+    /// as pushes (or never stop), which the request/reply connection can't pair with commands.
+    /// The confirmation setting, and confirming once, only cover the destructive/expensive prompt.
+    static func preflight(_ batch: [[[UInt8]]], table: CommandTable, confirmed: Bool, confirmsDangerousCommands: Bool) -> Preflight {
+        let classifications = batch.map { CommandSafety.classify($0, table: table) }
+        if classifications.contains(where: { if case .streaming = $0 { true } else { false } }) {
+            return .reject(String(localized: "SUBSCRIBE and MONITOR stream continuously; use Pub/Sub or the Profiler."))
+        }
+        guard !confirmed, confirmsDangerousCommands else { return .run }
+        for (arguments, classification) in zip(batch, classifications) {
+            switch classification {
+            case .destructive(let reason), .expensive(let reason):
+                let name = String(decoding: arguments[0], as: UTF8.self).uppercased()
+                return .confirm(title: String(localized: "Run \(name)?"), message: reason)
+            default: continue
+            }
+        }
+        return .run
+    }
+
     func run(_ source: String, confirmed: Bool = false) {
         let commands = Self.commands(in: source)
         guard !commands.isEmpty, let session = workspace.session, !isRunning else { return }
@@ -84,20 +110,16 @@ final class WorkbenchModel {
                 }
             }
             let table = (try? await session.commandTable()) ?? .empty
-            if !confirmed, UserDefaults.standard.object(forKey: SettingsKey.confirmDangerousCommands) as? Bool ?? true {
-                for arguments in parsed {
-                    switch CommandSafety.classify(arguments, table: table) {
-                    case .destructive(let reason), .expensive(let reason):
-                        let name = String(decoding: arguments[0], as: UTF8.self).uppercased()
-                        confirmation = .init(line: source, title: String(localized: "Run \(name)?"), message: reason, isDestructive: true)
-                        return
-                    case .streaming:
-                        record(commands: commands.map(\.line), text: String(localized: "SUBSCRIBE and MONITOR stream continuously; use Pub/Sub or the Profiler."),
-                               isError: true, duration: .zero, reply: nil)
-                        return
-                    default: continue
-                    }
-                }
+            let confirms = UserDefaults.standard.object(forKey: SettingsKey.confirmDangerousCommands) as? Bool ?? true
+            switch Self.preflight(parsed, table: table, confirmed: confirmed, confirmsDangerousCommands: confirms) {
+            case .run:
+                break
+            case .confirm(let title, let message):
+                confirmation = .init(line: source, title: title, message: message, isDestructive: true)
+                return
+            case .reject(let message):
+                record(commands: commands.map(\.line), text: message, isError: true, duration: .zero, reply: nil)
+                return
             }
             isRunning = true
             defer { isRunning = false }
