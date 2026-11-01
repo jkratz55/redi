@@ -10,6 +10,12 @@ import RedisWire
 ///   transparently after a drop. Long scans, MONITOR or Pub/Sub never delay interactive commands.
 ///   Commands in flight when a connection drops fail rather than being retried, because a retry
 ///   could run a non-idempotent command twice.
+/// - **Databases:** `select(database:)` switches one at a time. Commands issued during a switch wait
+///   for it, and every connection is brought to the current database before its next command, so
+///   one session never reads from one database and writes to another.
+/// - **Transactions:** MULTI/WATCH pin a role to one connection (and, in a cluster, one node) until
+///   EXEC/DISCARD. Redirects aren't followed inside a transaction, so a write can't escape it; if
+///   the pinned connection drops, the next command fails instead of running untransacted.
 /// - **Cluster:** routes by hash slot using the server's command table (or `COMMAND GETKEYS` for
 ///   movable keys), follows `MOVED`/`ASK`, splits pipelines per node and fans out to primaries.
 /// - **Sentinel:** resolves the primary from the sentinels and follows `+switch-master` live.
@@ -31,6 +37,9 @@ public actor RedisSession {
         case cli
         /// The Workbench's own connection.
         case workbench
+
+        /// Whether the role's connections follow the selected database (Pub/Sub and MONITOR don't).
+        var usesDatabase: Bool { self != .subscriber && self != .monitor }
     }
 
     public enum Target: Hashable, Sendable {
@@ -90,6 +99,10 @@ public actor RedisSession {
         case tooManyRedirects
         case noNodeForSlot(Int)
         case notCluster
+        /// The connection holding a MULTI or WATCH dropped, so the server discarded the transaction.
+        case transactionLost
+        /// A transaction's keys belong to different cluster nodes, so no single connection can run it.
+        case crossNodeTransaction
 
         public var description: String {
             switch self {
@@ -99,6 +112,10 @@ public actor RedisSession {
             case .tooManyRedirects: "The cluster redirected the command too many times."
             case .noNodeForSlot(let slot): "No cluster node serves slot \(slot)."
             case .notCluster: "This server isn't part of a cluster."
+            case .transactionLost:
+                "The connection was lost during the transaction, so the server discarded it and nothing queued was applied. Start again with MULTI (and WATCH)."
+            case .crossNodeTransaction:
+                "A transaction can only use keys served by one cluster node, and these keys belong to different nodes."
             }
         }
     }
@@ -123,12 +140,61 @@ public actor RedisSession {
         var node: RedisEndpoint
     }
 
+    /// A role's open MULTI or WATCH, tracked from the commands sent through `send` and `pipeline`.
+    /// The server keeps this state per connection, so the role stays on that one connection.
+    private struct Transaction {
+        var node: RedisEndpoint?
+        /// The connection the transaction lives on; if it's replaced, the transaction is gone.
+        var connection: ObjectIdentifier?
+        var inMulti = false
+        var watching = false
+        /// MULTI went to the default node because nothing had chosen one; it may still move.
+        var provisional = false
+        /// Commands sent since MULTI, errors included (an error marks the transaction failed).
+        var commandsInMulti = 0
+
+        var isActive: Bool { inMulti || watching }
+
+        mutating func apply(_ name: String, reply: RESPValue) {
+            switch name {
+            case "RESET":
+                inMulti = false
+                watching = false
+            case "EXEC", "DISCARD":
+                // Outside MULTI these just fail, and any WATCH stays in place.
+                if inMulti {
+                    inMulti = false
+                    watching = false
+                }
+            case "MULTI" where !inMulti:
+                if reply.serverError == nil {
+                    inMulti = true
+                    commandsInMulti = 0
+                }
+            case "WATCH" where !inMulti:
+                if reply.serverError == nil { watching = true }
+            case "UNWATCH" where !inMulti:
+                watching = false
+            default:
+                if inMulti { commandsInMulti += 1 }
+            }
+        }
+    }
+
+    /// Commands that start tracking a transaction for their role.
+    private static let transactionStarters: Set<String> = ["MULTI", "WATCH"]
+
     private let transportFactory: RedisTransportFactory
     private let eventContinuation: AsyncStream<Event>.Continuation
     private var tunnel: SSHTunnel?
     private var tunnelTask: Task<SSHTunnel, any Error>?
     private var connections: [Key: RedisConnection] = [:]
     private var connecting: [Key: Task<RedisConnection, any Error>] = [:]
+    /// The database each data connection is in. Compared with `database` before every use.
+    private var connectionDatabases: [Key: Int] = [:]
+    /// The database switch in progress (`select`); data connections wait for it.
+    private var databaseSwitch: Task<Void, any Error>?
+    private var transactions: [Role: Transaction] = [:]
     private var openTask: Task<ServerHello, any Error>?
     private var isOpen = false
     /// Set by `close()`; a closed session can't be reused.
@@ -200,13 +266,17 @@ public actor RedisSession {
         connecting.removeAll()
         for connection in connections.values { await connection.close() }
         connections.removeAll()
+        transactions.removeAll()
         tunnel?.close()
         tunnel = nil
         eventContinuation.finish()
     }
 
-    /// Closes the connections for `role` (e.g. when the Profiler stops).
+    /// Closes the connections for `role` (e.g. when the Profiler stops, or the CLI cancels a command).
+    /// The server discards any transaction they held; since that's deliberate, the next command
+    /// simply starts fresh rather than reporting the transaction as lost.
     public func release(_ role: Role) async {
+        transactions[role] = nil
         for key in connecting.keys where key.role == role { connecting.removeValue(forKey: key)?.cancel() }
         for key in connections.keys where key.role == role { await connections.removeValue(forKey: key)?.close() }
     }
@@ -223,26 +293,63 @@ public actor RedisSession {
 
     private var defaultNode: RedisEndpoint { topology?.primaries.first?.endpoint ?? primaryEndpoint }
 
+    /// The connection for `role` on `node`, in the session's current database.
     private func rawConnection(role: Role, node: RedisEndpoint) async throws -> RedisConnection {
-        if isClosed { throw RedisClientError.connectionClosed }
+        if role.usesDatabase { await waitForDatabaseSwitch() }
         let key = Key(role: role, node: node)
+        let connection = try await liveConnection(for: key)
+        try await reconcileDatabase(of: connection, key: key)
+        return connection
+    }
+
+    /// The open connection for `key`, connecting (once, shared by concurrent callers) if needed.
+    private func liveConnection(for key: Key) async throws -> RedisConnection {
+        if isClosed { throw RedisClientError.connectionClosed }
         if let existing = connections[key], await !existing.isClosed { return existing }
         if let inFlight = connecting[key] { return try await inFlight.value }
 
         let factory = transportFactory
         let task = Task { () throws -> RedisConnection in
-            let configuration = try await self.connectionConfiguration(for: node)
-            return try await RedisConnection.connect(configuration, transportFactory: factory)
+            let configuration = try await self.connectionConfiguration(for: key.node)
+            let connection = try await RedisConnection.connect(configuration, transportFactory: factory)
+            // Registered here, before any waiter resumes, together with the database the connection
+            // actually opened in: a switch may have happened while it was connecting.
+            try await self.register(connection, key: key, database: configuration.database)
+            return connection
         }
         connecting[key] = task
         defer { connecting[key] = nil }
-        let connection = try await task.value
+        return try await task.value
+    }
+
+    private func register(_ connection: RedisConnection, key: Key, database: Int) async throws {
         if isClosed {
             await connection.close()
             throw RedisClientError.connectionClosed
         }
         connections[key] = connection
-        return connection
+        connectionDatabases[key] = database
+    }
+
+    /// Waits for database switches in progress (including ones queued behind them).
+    private func waitForDatabaseSwitch() async {
+        var awaited: Task<Void, any Error>?
+        while let pending = databaseSwitch, pending != awaited {
+            _ = await pending.result
+            awaited = pending
+        }
+    }
+
+    /// Brings a data connection to the session's database. Skipped inside MULTI, where SELECT would
+    /// only be queued; the connection catches up after EXEC or DISCARD.
+    private func reconcileDatabase(of connection: RedisConnection, key: Key) async throws {
+        guard key.role.usesDatabase, !isCluster, transactions[key.role]?.inMulti != true else { return }
+        // Loops because the database can change again while SELECT is in flight.
+        while connections[key] === connection, let current = connectionDatabases[key], current != database {
+            let wanted = database
+            try await connection.execute(RedisCommand("SELECT", wanted))
+            if connections[key] === connection { connectionDatabases[key] = wanted }
+        }
     }
 
     /// The SSH tunnel (`nil` without one), reopened if its ssh master has exited, e.g. after the
@@ -298,10 +405,18 @@ public actor RedisSession {
     public func send(_ command: RedisCommand, role: Role = .command, target: Target = .automatic) async throws -> RESPValue {
         try await enforceReadOnly(command)
         if case .allPrimaries = target {
+            // A transaction lives on one connection; fanning out would run commands on the others
+            // immediately, outside it.
+            if transactions[role] != nil || Self.transactionStarters.contains(command.name) {
+                throw SessionError.crossNodeTransaction
+            }
             let replies = try await unguardedFanOut(command, role: role)
             return .map(replies.map { RESPPair(.simpleString($0.node.description), $0.reply) })
         }
         if !isOpen { try await open() }
+        if transactions[role] != nil || Self.transactionStarters.contains(command.name) {
+            return try await sendInTransaction(command, role: role, target: target)
+        }
         var node = try await route(command, target: target)
         var asking = false
         for _ in 0..<5 {
@@ -333,11 +448,16 @@ public actor RedisSession {
         try await send(command, role: role, target: target).throwIfError()
     }
 
-    /// Sends a batch, grouped per node in cluster mode, and returns replies in input order.
+    /// Sends a batch, grouped per node in cluster mode, and returns replies in input order. A batch
+    /// with a transaction (or sent while one is open) goes to a single connection, unsplit.
     public func pipeline(_ commands: [RedisCommand], role: Role = .command, target: Target = .automatic) async throws -> [RESPValue] {
         guard !commands.isEmpty else { return [] }
         for command in commands { try await enforceReadOnly(command) }
         if !isOpen { try await open() }
+        if target != .allPrimaries,
+           transactions[role] != nil || commands.contains(where: { Self.transactionStarters.contains($0.name) }) {
+            return try await pipelineInTransaction(commands, role: role, target: target)
+        }
 
         switch target {
         case .node(let node):
@@ -402,15 +522,128 @@ public actor RedisSession {
         }
     }
 
-    /// Switches every open data connection to `database`; connections opened later use it too.
+    /// Switches the session to `database`. Switches run one at a time, and data commands issued
+    /// meanwhile wait for it. The server validates the switch on the command connection first: if it
+    /// refuses (an index out of range, ACL), nothing changes. Other connections switch before their
+    /// next command.
     public func select(database: Int) async throws {
+        // Opened up front: opening waits for switches, so it can't happen inside one.
+        if !isOpen { try await open() }
+        let previous = databaseSwitch
+        let task = Task { () throws in
+            _ = await previous?.result
+            try await self.performSelect(database)
+        }
+        databaseSwitch = task
+        defer { if databaseSwitch == task { databaseSwitch = nil } }
+        try await task.value
+    }
+
+    private func performSelect(_ database: Int) async throws {
         guard database != self.database else { return }
         guard !isCluster else { throw SessionError.notCluster }
-        for (key, connection) in connections where key.role != .subscriber && key.role != .monitor {
-            guard await !connection.isClosed else { continue }
-            try await connection.execute(RedisCommand("SELECT", database))
-        }
+        let key = Key(role: .command, node: primaryEndpoint)
+        let connection = try await liveConnection(for: key)
+        try await connection.execute(RedisCommand("SELECT", database))
+        if connections[key] === connection { connectionDatabases[key] = database }
         self.database = database
+    }
+
+    // MARK: - Transactions
+
+    /// Sends a command for a role with an open transaction, or one starting it (MULTI, WATCH).
+    private func sendInTransaction(_ command: RedisCommand, role: Role, target: Target) async throws -> RESPValue {
+        var state = transactions[role] ?? Transaction()
+        let node: RedisEndpoint
+        if let pinned = state.node {
+            try await requireLiveTransaction(state, role: role)
+            if isCluster, state.provisional, state.commandsInMulti == 0, target == .automatic,
+               let owner = try await keyOwner(of: command), owner != pinned {
+                // Nothing has been sent inside MULTI yet, so it can move to the node owning this key.
+                _ = try await rawConnection(role: role, node: pinned).send(RedisCommand("DISCARD"))
+                transactions[role] = nil
+                let moved = try await rawConnection(role: role, node: owner)
+                let reply = try await moved.send(RedisCommand("MULTI"))
+                if let error = reply.serverError { throw error }
+                state.node = owner
+                state.connection = ObjectIdentifier(moved)
+                state.provisional = false
+                node = owner
+            } else {
+                node = pinned
+            }
+        } else {
+            node = try await transactionNode(for: [command], target: target)
+            state.node = node
+            state.provisional = isCluster && target == .automatic && command.name == "MULTI"
+        }
+        let connection = try await rawConnection(role: role, node: node)
+        if state.connection == nil { state.connection = ObjectIdentifier(connection) }
+        // Redirects aren't followed: resending to another node would run the command outside the
+        // transaction. The server marks the transaction failed instead, so EXEC applies nothing.
+        let reply = try await connection.send(command)
+        state.apply(command.name, reply: reply)
+        transactions[role] = state.isActive ? state : nil
+        return reply
+    }
+
+    /// Sends a batch containing (or continuing) a transaction on one connection.
+    private func pipelineInTransaction(_ commands: [RedisCommand], role: Role, target: Target) async throws -> [RESPValue] {
+        var state = transactions[role] ?? Transaction()
+        let node: RedisEndpoint
+        if let pinned = state.node {
+            try await requireLiveTransaction(state, role: role)
+            node = pinned
+        } else {
+            node = try await transactionNode(for: commands, target: target)
+            state.node = node
+        }
+        let connection = try await rawConnection(role: role, node: node)
+        if state.connection == nil { state.connection = ObjectIdentifier(connection) }
+        let replies = try await connection.pipeline(commands)
+        for (command, reply) in zip(commands, replies) { state.apply(command.name, reply: reply) }
+        transactions[role] = state.isActive ? state : nil
+        return replies
+    }
+
+    /// Fails (and forgets the transaction) if the connection it lived on has dropped or been replaced.
+    private func requireLiveTransaction(_ state: Transaction, role: Role) async throws {
+        if let node = state.node, let id = state.connection, let existing = connections[Key(role: role, node: node)],
+           ObjectIdentifier(existing) == id, await !existing.isClosed {
+            return
+        }
+        transactions[role] = nil
+        throw SessionError.transactionLost
+    }
+
+    /// The node for a new transaction: the target node, or in a cluster the single node owning every
+    /// key in `commands` (the default node when they're keyless). Keys on several nodes are refused
+    /// before anything is sent.
+    private func transactionNode(for commands: [RedisCommand], target: Target) async throws -> RedisEndpoint {
+        if case .node(let node) = target { return node }
+        guard let topology else { return primaryEndpoint }
+        var owners = Set<RedisEndpoint>()
+        for command in commands {
+            if command.name == "WATCH" {
+                for key in command.arguments.dropFirst() {
+                    let slot = HashSlot.slot(for: key)
+                    guard let node = topology.primary(forSlot: slot) else { throw SessionError.noNodeForSlot(slot) }
+                    owners.insert(node.endpoint)
+                }
+            } else if let owner = try await keyOwner(of: command) {
+                owners.insert(owner)
+            }
+        }
+        guard owners.count <= 1 else { throw SessionError.crossNodeTransaction }
+        return owners.first ?? defaultNode
+    }
+
+    /// The primary owning the command's first key, or `nil` for keyless commands and non-clusters.
+    private func keyOwner(of command: RedisCommand) async throws -> RedisEndpoint? {
+        guard let topology, let key = try await firstKey(of: command) else { return nil }
+        let slot = HashSlot.slot(for: key)
+        guard let node = topology.primary(forSlot: slot) else { throw SessionError.noNodeForSlot(slot) }
+        return node.endpoint
     }
 
     // MARK: - Command metadata

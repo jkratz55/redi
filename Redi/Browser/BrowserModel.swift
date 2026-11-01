@@ -326,8 +326,12 @@ final class BrowserModel {
 
     /// Called after switching databases. Pending delete undos belong to the old database, so they're
     /// dropped rather than left to fail (`KeyOperations.restore` also refuses another database).
+    /// The open editor is closed explicitly: it holds the old database's value, and saving it would
+    /// write that value into the new database. Table and outline selection callbacks aren't relied on
+    /// for this, because a key shown programmatically (Add Key, Rename) has no selected row to clear.
     func databaseDidChange() {
         undoManager?.removeAllActions(withTarget: self)
+        detail = nil
         reload()
     }
 

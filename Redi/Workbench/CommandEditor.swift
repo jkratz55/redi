@@ -5,10 +5,31 @@ import SwiftUI
 /// Redis command editor: TextKit 2 `NSTextView` with incremental syntax highlighting and native
 /// completion (Esc, or Tab after a partial command name).
 struct CommandEditor: NSViewRepresentable {
+    /// Where the caret is: the text before it on its line (for the inline syntax hint), the whole
+    /// line it's on (for Run Line) and the selected text.
+    struct CaretContext: Equatable {
+        var beforeCaret = ""
+        var line = ""
+        var selection = ""
+    }
+
     @Binding var text: String
     let catalog: CommandCatalog
-    /// Reports the line under the caret (for the inline syntax hint) and the selected text.
-    var onCaretLine: (String, String) -> Void = { _, _ in }
+    var onCaretLine: (CaretContext) -> Void = { _ in }
+
+    /// The caret context for `selection` in `string`. The line is the one containing the start of the
+    /// selection, taken by position, so two lines with the same prefix can't be confused.
+    static func caretContext(in string: String, selection: NSRange) -> CaretContext {
+        let string = string as NSString
+        let location = min(max(0, selection.location), string.length)
+        let lineRange = string.lineRange(for: NSRange(location: location, length: 0))
+        let line = string.substring(with: lineRange).trimmingCharacters(in: .newlines)
+        let caretInLine = location - lineRange.location
+        let selectionRange = NSIntersectionRange(selection, NSRange(location: 0, length: string.length))
+        return CaretContext(beforeCaret: String(line.prefix(max(0, caretInLine))),
+                            line: line,
+                            selection: selectionRange.length > 0 ? string.substring(with: selectionRange) : "")
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text, onCaretLine: onCaretLine) }
 
@@ -66,10 +87,10 @@ struct CommandEditor: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextViewDelegate, NSTextStorageDelegate {
         var text: Binding<String>
-        var onCaretLine: (String, String) -> Void
+        var onCaretLine: (CaretContext) -> Void
         let highlighter = CommandHighlighter()
 
-        init(text: Binding<String>, onCaretLine: @escaping (String, String) -> Void) {
+        init(text: Binding<String>, onCaretLine: @escaping (CaretContext) -> Void) {
             self.text = text
             self.onCaretLine = onCaretLine
         }
@@ -86,13 +107,7 @@ struct CommandEditor: NSViewRepresentable {
         }
 
         private func reportCaret(_ textView: NSTextView) {
-            let string = textView.string as NSString
-            let selection = textView.selectedRange()
-            let lineRange = string.lineRange(for: NSRange(location: min(selection.location, string.length), length: 0))
-            let line = string.substring(with: lineRange).trimmingCharacters(in: .newlines)
-            let caretInLine = selection.location - lineRange.location
-            let beforeCaret = String(line.prefix(max(0, caretInLine)))
-            onCaretLine(beforeCaret, selection.length > 0 ? string.substring(with: selection) : "")
+            onCaretLine(CommandEditor.caretContext(in: textView.string, selection: textView.selectedRange()))
         }
 
         // Re-highlight only the paragraphs touched by each edit.

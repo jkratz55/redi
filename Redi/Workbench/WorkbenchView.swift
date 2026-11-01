@@ -5,18 +5,14 @@ import SwiftUI
 struct WorkbenchView: View {
     @Bindable var model: WorkbenchModel
     let workspace: WorkspaceModel
-    @State private var caretPrefix = ""
-    @State private var selectedText = ""
+    @State private var caret = CommandEditor.CaretContext()
 
     var body: some View {
         VSplitView {
             VStack(spacing: 0) {
                 toolbar
                 Divider()
-                CommandEditor(text: $model.text, catalog: model.catalog) { prefix, selection in
-                    caretPrefix = prefix
-                    selectedText = selection
-                }
+                CommandEditor(text: $model.text, catalog: model.catalog) { caret = $0 }
                 .frame(minHeight: 120)
                 Divider()
                 hintBar
@@ -37,16 +33,16 @@ struct WorkbenchView: View {
     private var toolbar: some View {
         HStack(spacing: 8) {
             Button {
-                model.run(selectedText.isEmpty ? model.text : selectedText)
+                model.run(caret.selection.isEmpty ? model.text : caret.selection)
             } label: {
-                Label(selectedText.isEmpty ? "Run All" : "Run Selection", systemImage: "play.fill")
+                Label(caret.selection.isEmpty ? "Run All" : "Run Selection", systemImage: "play.fill")
             }
             .keyboardShortcut(.return, modifiers: .command)
             .disabled(model.isRunning)
             .accessibilityIdentifier("workbench.run")
 
             Button {
-                model.run(currentLine)
+                model.run(caret.line)
             } label: {
                 Label("Run Line", systemImage: "arrow.right.to.line")
             }
@@ -75,16 +71,9 @@ struct WorkbenchView: View {
         .padding(8)
     }
 
-    /// The full line under the caret (the editor reports only the part before the caret).
-    private var currentLine: String {
-        guard let line = model.text.split(separator: "\n", omittingEmptySubsequences: false)
-            .first(where: { $0.hasPrefix(caretPrefix) && !caretPrefix.isEmpty }) else { return caretPrefix }
-        return String(line)
-    }
-
     private var hintBar: some View {
         HStack {
-            if let doc = model.catalog.doc(for: caretPrefix.split(separator: " ").map(String.init).filter { Int($0) == nil }) {
+            if let doc = model.catalog.doc(for: caret.beforeCaret.split(separator: " ").map(String.init).filter { Int($0) == nil }) {
                 Text(doc.synopsis).font(.caption.monospaced()).lineLimit(1).truncationMode(.tail)
                 Text("— \(doc.summary)").font(.caption).foregroundStyle(.secondary).lineLimit(1)
             } else {
