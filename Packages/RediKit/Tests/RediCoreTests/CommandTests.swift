@@ -157,6 +157,60 @@ struct CommandCatalogTests {
         #expect(try check("MYMODULE.DO x") == .unverified)
     }
 
+    /// Admin commands change server state without being flagged `write`, so with server metadata an
+    /// admin command is only allowed when it's known to read.
+    @Test("Read-only mode allows admin commands only when they're known reads", .enabled(if: RedisServerFixture.isAvailable))
+    func readOnlyAdminCommands() async throws {
+        let server = try await RedisServerFixture()
+        let session = RedisSession(configuration: server.configuration(), options: RedisSession.Options(isReadOnly: true))
+        let table = try await session.commandTable()
+        #expect(table.info(named: "client|unpause")?.isAdmin == true)
+        #expect(table.info(named: "client|unpause")?.isWrite == false, "the server doesn't flag it write; the admin rule must catch it")
+
+        // Everything the app reads in read-only mode (browsing, Overview, Slow Log, Profiler, Pub/Sub,
+        // command docs), plus admin commands that only read.
+        for line in ["TYPE k", "PTTL k", "SCAN 0 MATCH * COUNT 500", "DBSIZE", "INFO", "INFO replication", "CONFIG GET slowlog-*",
+                     "MEMORY USAGE k SAMPLES 0", "OBJECT ENCODING k", "SLOWLOG GET 128", "SLOWLOG LEN", "MONITOR", "PUBSUB CHANNELS",
+                     "PUBSUB NUMSUB ch", "COMMAND", "COMMAND DOCS", "XINFO GROUPS k", "CLIENT LIST", "CLIENT INFO",
+                     "LATENCY LATEST", "ACL WHOAMI", "ACL LIST", "ACL USERS", "ACL GETUSER default", "ACL LOG", "ACL LOG 10",
+                     "MODULE LIST", "LASTSAVE", "ROLE"] {
+            #expect(try check(line, table: table) == .allowed, "\(line)")
+        }
+        for line in ["SAVE", "BGSAVE", "BGREWRITEAOF", "CLIENT UNPAUSE", "CLIENT NO-EVICT on", "CLIENT UNBLOCK 1",
+                     "MODULE LOADEX /tmp/x.so", "ACL LOG RESET", "SCRIPT KILL", "FUNCTION KILL", "SLOWLOG RESET", "LATENCY RESET"] {
+            #expect(try check(line, table: table) == .forbidden, "\(line)")
+        }
+        await #expect(throws: RedisSession.SessionError.readOnly("CLIENT")) { try await session.send(RedisCommand("CLIENT", "UNPAUSE")) }
+        await session.close()
+    }
+
+    @Test("Commands carrying a password are recognised, as redis-cli does for its history")
+    func sensitiveCommands() {
+        for line in ["AUTH secret", "auth user secret", "HELLO 3 AUTH user secret", "hello 3 setname me auth u p",
+                     "MIGRATE h 6379 k 0 1000 AUTH pw", "MIGRATE h 6379 \"\" 0 1000 AUTH2 user pw KEYS a b",
+                     "ACL SETUSER alice on >pw", "CONFIG SET requirepass pw", "config set maxmemory 1 masterauth pw",
+                     "CONFIG SET masteruser u", "SENTINEL SET mymaster auth-pass pw", "SENTINEL CONFIG SET sentinel-pass pw",
+                     "AUTH \"unclosed"] {
+            #expect(CommandSafety.isSensitive(line: line), "\(line)")
+        }
+        for line in ["GET auth", "HELLO 3", "CONFIG SET maxmemory 1", "CONFIG GET requirepass", "ACL LIST", "MIGRATE h 6379 k 0 1000",
+                     "SET k v", "SENTINEL MASTERS", ""] {
+            #expect(!CommandSafety.isSensitive(line: line), "\(line)")
+        }
+        #expect(CommandSafety.redacted(line: "AUTH secret") == "AUTH ••••")
+        #expect(CommandSafety.redacted(line: "acl setuser alice on >pw") == "ACL SETUSER ••••")
+        #expect(CommandSafety.redacted(line: "CONFIG SET requirepass pw") == "CONFIG SET ••••")
+        #expect(CommandSafety.redacted(line: "HELLO 3 AUTH u p") == "HELLO ••••")
+        #expect(CommandSafety.redacted(line: "GET k") == nil)
+    }
+
+    @Test("SAVE asks first; MODULE LOADEX is destructive like MODULE LOAD")
+    func saveAndModuleLoadex() throws {
+        #expect(CommandSafety.classify(try CommandLineParser.split("SAVE"), table: .empty) == .expensive(CommandSafety.expensive["save"]!))
+        #expect(CommandSafety.classify(try CommandLineParser.split("MODULE LOADEX /tmp/x.so"), table: .empty) == .destructive("Loads code into the server."))
+        #expect(CommandSafety.classify(try CommandLineParser.split("BGSAVE"), table: .empty) == .normal)
+    }
+
     @Test("Read-only mode refuses scripts and admin writes the server doesn't flag", .enabled(if: RedisServerFixture.isAvailable))
     func readOnlyScripts() async throws {
         let server = try await RedisServerFixture()

@@ -47,7 +47,10 @@ final class CLIModel {
 
     init(workspace: WorkspaceModel) {
         self.workspace = workspace
-        history = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: historyURL))) ?? []
+        let saved = (try? JSONDecoder().decode([String].self, from: Data(contentsOf: historyURL))) ?? []
+        history = saved.filter { !CommandSafety.isSensitive(line: $0) }
+        // Earlier versions saved password-bearing lines; rewrite the file without them.
+        if history.count != saved.count { saveHistory() }
     }
 
     private var historyURL: URL {
@@ -73,7 +76,8 @@ final class CLIModel {
         input = ""
         historyIndex = nil
         guard !line.isEmpty else { return }
-        remember(line)
+        // Like redis-cli, lines carrying a password are never added to history, in memory or on disk.
+        if !CommandSafety.isSensitive(line: line) { remember(line) }
         run(line, confirmed: false)
     }
 
@@ -199,6 +203,10 @@ final class CLIModel {
     private func remember(_ line: String) {
         if history.last != line { history.append(line) }
         if history.count > Self.maxHistory { history.removeFirst(history.count - Self.maxHistory) }
+        saveHistory()
+    }
+
+    private func saveHistory() {
         let history = self.history
         let url = historyURL
         Task.detached(priority: .utility) {

@@ -41,12 +41,14 @@ public enum CommandSafety {
         "slaveof": "Changes replication for this server.",
         "failover": "Starts a coordinated failover.",
         "module|load": "Loads code into the server.",
+        "module|loadex": "Loads code into the server.",
         "module|unload": "Unloads a server module.",
         "migrate": "Moves keys to another server.",
     ]
 
     static let expensive: [String: String] = [
         "keys": "KEYS blocks the server while it scans every key. Use the Key Browser (SCAN) on large databases.",
+        "save": "SAVE blocks the server while it writes the whole dataset to disk. BGSAVE saves in the background.",
         "smembers": "Returns every member at once; large sets can be slow.",
         "hgetall": "Returns every field at once; large hashes can be slow.",
     ]
@@ -63,7 +65,7 @@ public enum CommandSafety {
         default: break
         }
         if let reason = destructive[sub] ?? destructive[name] { return .destructive(reason) }
-        if name == "keys" { return .expensive(expensive["keys"]!) }
+        if name == "keys" || name == "save" { return .expensive(expensive[name]!) }
         if let info = table.info(for: arguments), info.isBlocking { return .blocking }
         return .normal
     }
@@ -84,6 +86,62 @@ public enum CommandSafety {
 
     static let connectionCommands: Set<String> = ["auth", "hello", "reset", "quit"]
 
+    // MARK: Secrets
+
+    /// Whether the command carries a password, so it mustn't be kept in history or saved results.
+    /// Modelled on redis-cli's list, which never adds these to its history: AUTH, HELLO … AUTH,
+    /// MIGRATE … AUTH/AUTH2, ACL SETUSER, CONFIG SET of a password setting, and Sentinel's
+    /// password settings. Matching is by word anywhere in the command, so a key or client name that
+    /// happens to be "auth" errs on the side of hiding the line.
+    public static func isSensitive(_ arguments: [[UInt8]]) -> Bool {
+        guard let first = arguments.first else { return false }
+        let words = arguments.prefix(64).map { String(decoding: $0.prefix(64), as: UTF8.self).lowercased() }
+        let rest = words.dropFirst()
+        switch String(decoding: first, as: UTF8.self).lowercased() {
+        case "auth": return true
+        case "hello": return rest.contains("auth")
+        case "migrate": return rest.contains("auth") || rest.contains("auth2")
+        case "acl": return words.count > 1 && words[1] == "setuser"
+        case "config": return words.count > 1 && words[1] == "set" && rest.contains(where: sensitiveSettings.contains)
+        case "sentinel":
+            guard words.count > 1 else { return false }
+            if words[1] == "set" { return rest.contains("auth-pass") || rest.contains("auth-user") }
+            return words[1] == "config" && rest.contains(where: sensitiveSettings.contains)
+        default: return false
+        }
+    }
+
+    /// `isSensitive` for a typed line, including one that doesn't parse (an unclosed quote), so a
+    /// mistyped `AUTH "secret` is caught too.
+    public static func isSensitive(line: String) -> Bool {
+        isSensitive(bestEffortSplit(line))
+    }
+
+    /// A sensitive command with its arguments hidden ("AUTH ••••", "CONFIG SET ••••"), or nil when
+    /// it isn't sensitive.
+    public static func redacted(_ arguments: [[UInt8]]) -> String? {
+        guard isSensitive(arguments), let first = arguments.first else { return nil }
+        let name = String(decoding: first, as: UTF8.self).uppercased()
+        if ["ACL", "CONFIG", "SENTINEL"].contains(name), arguments.count > 1 {
+            return "\(name) \(String(decoding: arguments[1], as: UTF8.self).uppercased()) ••••"
+        }
+        return "\(name) ••••"
+    }
+
+    /// `redacted` for a typed line, including one that doesn't parse.
+    public static func redacted(line: String) -> String? {
+        redacted(bestEffortSplit(line))
+    }
+
+    private static func bestEffortSplit(_ line: String) -> [[UInt8]] {
+        (try? CommandLineParser.split(line)) ?? line.split(whereSeparator: \.isWhitespace).map { Array($0.utf8) }
+    }
+
+    static let sensitiveSettings: Set<String> = [
+        "requirepass", "masterauth", "masteruser", "tls-key-file-pass", "tls-client-key-file-pass",
+        "sentinel-pass", "sentinel-user",
+    ]
+
     public enum ReadOnlyCheck: Sendable, Hashable {
         case allowed
         /// Changes data or server state.
@@ -96,6 +154,9 @@ public enum CommandSafety {
     /// Whether read-only mode allows the command. Refused:
     /// - the destructive commands above and `readOnlyForbidden`, whatever the server's flags say;
     /// - anything the server flags `write`;
+    /// - anything the server flags `admin` that isn't in `knownReads`. Admin commands change server
+    ///   state without being flagged `write` (SAVE, CLIENT UNPAUSE, ACL LOG RESET), so only the
+    ///   ones known to read are let through;
     /// - without server metadata for the command, anything not in `knownReads` (fail closed).
     public static func readOnlyCheck(_ arguments: [[UInt8]], table: CommandTable) -> ReadOnlyCheck {
         guard let first = arguments.first else { return .allowed }
@@ -104,8 +165,15 @@ public enum CommandSafety {
         if destructive[sub] != nil || destructive[name] != nil || readOnlyForbidden.contains(sub) || readOnlyForbidden.contains(name) {
             return .forbidden
         }
-        if let info = table.info(for: arguments) { return info.isWrite ? .forbidden : .allowed }
-        if knownReads.contains(name) || knownReads.contains(sub) { return .allowed }
+        // ACL LOG reads the log; ACL LOG RESET clears it.
+        if sub == "acl|log" {
+            return arguments.count > 2 && String(decoding: arguments[2], as: UTF8.self).lowercased() == "reset" ? .forbidden : .allowed
+        }
+        let isKnownRead = knownReads.contains(name) || knownReads.contains(sub)
+        if let info = table.info(for: arguments) {
+            return info.isWrite || (info.isAdmin && !isKnownRead) ? .forbidden : .allowed
+        }
+        if isKnownRead { return .allowed }
         return fallbackWrites.contains(name) ? .forbidden : .unverified
     }
 
@@ -121,6 +189,8 @@ public enum CommandSafety {
         // Messages reach other clients; the Pub/Sub publish button is disabled in read-only mode too.
         "publish", "spublish",
         "slowlog|reset", "latency|reset", "client|pause", "acl|load", "acl|save",
+        // Abort another client's running script or function.
+        "script|kill", "function|kill",
         "cluster|meet", "cluster|addslots", "cluster|addslotsrange", "cluster|delslots", "cluster|delslotsrange",
         "cluster|setslot", "cluster|replicate", "cluster|saveconfig", "cluster|bumpepoch", "cluster|set-config-epoch",
     ]
@@ -133,11 +203,13 @@ public enum CommandSafety {
         "multi", "exec", "discard", "watch", "unwatch", "monitor",
         "config|get", "client|list", "client|info", "client|getname", "client|id",
         "slowlog|get", "slowlog|len", "latency|latest", "latency|history", "latency|doctor", "latency|histogram", "latency|graph",
-        "acl|whoami", "acl|cat", "acl|list", "acl|users", "acl|getuser", "module|list",
+        "acl|whoami", "acl|cat", "acl|list", "acl|users", "acl|getuser", "acl|dryrun", "module|list",
+        "backup|list", "backup|status", "hotkeys|get",
         "memory|usage", "memory|stats", "memory|doctor", "memory|malloc-stats",
         "object|encoding", "object|freq", "object|idletime", "object|refcount",
         "cluster|info", "cluster|nodes", "cluster|slots", "cluster|shards", "cluster|myid", "cluster|myshardid",
         "cluster|keyslot", "cluster|countkeysinslot", "cluster|getkeysinslot", "cluster|links", "cluster|replicas", "cluster|slaves",
+        "cluster|count-failure-reports", "cluster|slot-stats",
         // Keys
         "exists", "type", "ttl", "pttl", "expiretime", "pexpiretime", "dump", "keys", "scan", "randomkey", "touch", "sort_ro",
         // Strings and bitmaps

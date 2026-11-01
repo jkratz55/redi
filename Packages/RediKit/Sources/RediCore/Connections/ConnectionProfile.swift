@@ -186,8 +186,10 @@ extension ConnectionProfile {
         }
         profile.host = host.hasPrefix("[") ? String(host.dropFirst().dropLast()) : host
         profile.port = components.port ?? 6379
-        var password = components.password?.removingPercentEncoding
-        if let user = components.user?.removingPercentEncoding, !user.isEmpty {
+        // `user` and `password` are already percent-decoded; decoding again would turn `%2525` into
+        // `%` rather than `%25`, and give up on a literal `%` (`50%25off` → nil).
+        var password = components.password
+        if let user = components.user, !user.isEmpty {
             // `redis://:password@host` has an empty user; `redis://password@host` is ambiguous and
             // treated as a password, as redis-cli does.
             if password == nil {

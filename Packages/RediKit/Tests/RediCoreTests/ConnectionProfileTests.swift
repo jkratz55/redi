@@ -24,6 +24,31 @@ struct ConnectionProfileTests {
         #expect(profile.tls.isEnabled == tls)
     }
 
+    /// URLComponents decodes `user` and `password` itself; they must not be decoded a second time.
+    @Test("Percent escapes in credentials are decoded exactly once", arguments: [
+        ("redis://alice:p%2525ss@localhost", "alice", "p%25ss"),
+        ("redis://alice:50%25off@localhost", "alice", "50%off"),
+        ("redis://alice:p%40ss@localhost", "alice", "p@ss"),
+        ("redis://al%3Aice%2525:pw@localhost", "al:ice%25", "pw"),
+        ("redis://:100%25@localhost", "", "100%"),
+    ])
+    func credentialsDecodeOnce(text: String, user: String, password: String) throws {
+        let (profile, parsedPassword) = try ConnectionProfile.parse(url: text)
+        #expect(profile.username == user)
+        #expect(parsedPassword == password)
+    }
+
+    @Test("A shareable URL round-trips a username with reserved characters")
+    func usernameRoundTrip() throws {
+        var profile = ConnectionProfile(host: "h", port: 6379)
+        profile.username = "a@b%c:d"
+        // A URL with only a user part means a password (as in redis-cli), so add one to read it back.
+        let withPassword = profile.url.replacingOccurrences(of: "@h:", with: ":pw@h:")
+        let parsed = try ConnectionProfile.parse(url: withPassword)
+        #expect(parsed.profile.username == "a@b%c:d")
+        #expect(parsed.password == "pw")
+    }
+
     @Test("Rejects non-Redis URLs")
     func badURLs() {
         #expect(throws: ConnectionProfile.URLError.self) { try ConnectionProfile.parse(url: "http://example.com") }

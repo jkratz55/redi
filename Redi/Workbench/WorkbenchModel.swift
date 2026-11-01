@@ -49,7 +49,10 @@ final class WorkbenchModel {
         let directory = RediDirectories.connectionData(workspace.profile.id)
         text = (try? String(contentsOf: directory.appending(path: "workbench.txt"), encoding: .utf8))
             ?? "// Run with ⌘↩ (selection or everything) or ⇧⌘↩ (current line).\n// Prefix a command with a number to repeat it, e.g. 10 INCR counter\nINFO server\n"
-        results = (try? JSONDecoder().decode([Result].self, from: Data(contentsOf: directory.appending(path: "workbench-results.json")))) ?? []
+        let saved = (try? JSONDecoder().decode([Result].self, from: Data(contentsOf: directory.appending(path: "workbench-results.json")))) ?? []
+        results = saved.map(Self.scrubbed)
+        // Earlier versions saved password-bearing commands as typed; rewrite the file without them.
+        if results != saved { saveResults() }
     }
 
     var catalog: CommandCatalog { workspace.commandCatalog }
@@ -164,7 +167,8 @@ final class WorkbenchModel {
                     text = ReplyFormatter.cliText(replies[0])
                 } else {
                     text = zip(parsed, replies).map { arguments, reply in
-                        "> " + arguments.map(CommandLineParser.quote).joined(separator: " ") + "\n" + ReplyFormatter.cliText(reply)
+                        "> " + (CommandSafety.redacted(arguments) ?? arguments.map(CommandLineParser.quote).joined(separator: " "))
+                            + "\n" + ReplyFormatter.cliText(reply)
                     }.joined(separator: "\n\n")
                 }
                 record(commands: display, text: text, isError: replies.contains { $0.serverError != nil },
@@ -195,7 +199,33 @@ final class WorkbenchModel {
         Task { await workspace.session?.release(.workbench) }
     }
 
+    // MARK: - Secrets
+
+    /// A command line as saved in a result: one carrying a password is hidden (`AUTH ••••`,
+    /// `3 CONFIG SET ••••`). The draft in the editor is the user's own text and stays as typed.
+    static func savedLine(_ line: String) -> String {
+        let parts = line.split(separator: " ", maxSplits: 1)
+        if parts.count == 2, let count = Int(parts[0]), count > 0, let hidden = CommandSafety.redacted(line: String(parts[1])) {
+            return "\(count) \(hidden)"
+        }
+        return CommandSafety.redacted(line: line) ?? line
+    }
+
+    /// A result from an earlier version with its commands, and the `> command` lines echoed in its
+    /// text, hidden the same way.
+    static func scrubbed(_ result: Result) -> Result {
+        var result = result
+        result.commands = result.commands.map(savedLine)
+        guard result.text.contains("> ") else { return result }
+        result.text = result.text.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+            guard line.hasPrefix("> "), let hidden = CommandSafety.redacted(line: String(line.dropFirst(2))) else { return String(line) }
+            return "> " + hidden
+        }.joined(separator: "\n")
+        return result
+    }
+
     private func record(commands: [String], text: String, isError: Bool, duration: Duration, reply: RESPValue?) {
+        let commands = commands.map(Self.savedLine)
         let milliseconds = Double(duration.components.seconds) * 1000 + Double(duration.components.attoseconds) / 1e15
         var trimmed = text
         if trimmed.utf8.count > Self.maxResultText {
