@@ -16,6 +16,7 @@ struct ConnectionEditor: View {
     @State private var urlError: String?
     @State private var testState: TestState = .idle
     @State private var importTarget: FileTarget?
+    @State private var importProblem: ImportProblem?
     @State private var discoveredMasters: [SentinelMaster] = []
     @State private var discoveryError: String?
     @State private var additionalSentinelsText: String
@@ -26,9 +27,15 @@ struct ConnectionEditor: View {
         case idle, testing, succeeded(String), failed(String)
     }
 
-    private enum FileTarget: Identifiable {
+    enum FileTarget: Identifiable {
         case caCertificate, clientCertificate, clientKey, sshKey
         var id: Self { self }
+    }
+
+    /// A certificate or key file that couldn't be used, with the Terminal commands that convert it.
+    struct ImportProblem: Equatable {
+        var message: String
+        var commands: String
     }
 
     init(profile: ConnectionProfile? = nil, secrets: ConnectionSecrets = ConnectionSecrets(),
@@ -138,7 +145,7 @@ struct ConnectionEditor: View {
     }
 
     private var tlsSection: some View {
-        Section("TLS") {
+        Section {
             Toggle("Use TLS", isOn: $profile.tls.isEnabled)
             if profile.tls.isEnabled {
                 TextField("Server Name (SNI)", text: $profile.tls.serverName, prompt: Text(profile.host))
@@ -163,6 +170,19 @@ struct ConnectionEditor: View {
                 Toggle("Verify server certificate", isOn: $profile.tls.verifiesCertificate)
                 Toggle("Verify hostname", isOn: $profile.tls.verifiesHostname)
                     .disabled(!profile.tls.verifiesCertificate)
+            }
+        } header: {
+            Text("TLS")
+        } footer: {
+            if let importProblem, profile.tls.isEnabled {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label(importProblem.message, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(verbatim: importProblem.commands)
+                        .font(.system(.callout, design: .monospaced))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .textSelection(.enabled)
             }
         }
     }
@@ -294,8 +314,9 @@ struct ConnectionEditor: View {
             profile.ssh.privateKeyPath = url.path
             return
         }
+        importProblem = nil
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            testState = .failed(String(localized: "\(url.lastPathComponent) isn't a text (PEM) file."))
+            importProblem = Self.notPEMProblem(file: url, target: target)
             return
         }
         switch target {
@@ -311,6 +332,47 @@ struct ConnectionEditor: View {
         case .sshKey:
             break
         }
+    }
+
+    /// Certificates and keys are kept as PEM text, so a binary file (PKCS#12 or DER) is refused with
+    /// the commands that convert it. They call macOS's own `/usr/bin/openssl` (LibreSSL), which reads
+    /// old and new PKCS#12 encryption alike; Homebrew's OpenSSL 3 refuses older files without `-legacy`.
+    static func notPEMProblem(file: URL, target: FileTarget) -> ImportProblem {
+        let name = file.lastPathComponent
+        let stem = file.deletingPathExtension().lastPathComponent
+        let input = shellQuoted(name)
+        func output(_ suffix: String) -> String { shellQuoted(stem + suffix) }
+        let cd = "cd " + shellQuoted(file.deletingLastPathComponent().path)
+        let openssl = "/usr/bin/openssl"
+        let message: String
+        let commands: [String]
+        if ["p12", "pfx"].contains(file.pathExtension.lowercased()) {
+            if target == .caCertificate {
+                message = String(localized: "“\(name)” is a PKCS#12 file. Redi needs CA certificates as a PEM file; export them in Terminal:")
+                commands = ["\(openssl) pkcs12 -in \(input) -cacerts -nokeys -out \(output("-ca.pem"))"]
+            } else {
+                message = String(localized: "“\(name)” is a PKCS#12 file. Redi needs the certificate and private key as separate PEM files; export them in Terminal, then choose the first as Client Certificate and the second as Client Key:")
+                commands = ["\(openssl) pkcs12 -in \(input) -clcerts -nokeys -out \(output("-cert.pem"))",
+                            "\(openssl) pkcs12 -in \(input) -nocerts -nodes -out \(output("-key.pem"))"]
+            }
+        } else {
+            let converted = output(file.pathExtension.lowercased() == "pem" ? "-converted.pem" : ".pem")
+            if target == .clientKey {
+                message = String(localized: "“\(name)” isn't a text (PEM) file. If it's a DER private key, convert it in Terminal:")
+                commands = ["\(openssl) pkey -inform der -in \(input) -out \(converted)"]
+            } else {
+                message = String(localized: "“\(name)” isn't a text (PEM) file. If it's a DER certificate, convert it in Terminal:")
+                commands = ["\(openssl) x509 -inform der -in \(input) -out \(converted)"]
+            }
+        }
+        return ImportProblem(message: message, commands: ([cd] + commands).joined(separator: "\n"))
+    }
+
+    /// `text` as one shell word: unchanged when it's plainly safe, otherwise single-quoted.
+    static func shellQuoted(_ text: String) -> String {
+        let safe = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./+@%,:")
+        if !text.isEmpty, text.unicodeScalars.allSatisfy(safe.contains) { return text }
+        return "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private func test() async {

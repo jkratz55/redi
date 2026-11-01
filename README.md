@@ -3,10 +3,10 @@
 A fast, native Redis client for macOS, covering the same ground as Redis Insight, built with
 Swift, SwiftUI and AppKit.
 
-- **Connections**: standalone, Cluster and Sentinel; TLS (custom CA, client certificates from PEM or
-  PKCS#12); SSH tunnels through the system `ssh` (your `~/.ssh/config`, agents and ProxyJump work);
-  passwords in the Keychain; `redis://` URL paste; import from Redis Insight; read-only and
-  production markers.
+- **Connections**: standalone, Cluster and Sentinel; TLS (custom CA, client certificate and key as
+  PEM files; choosing a `.p12` shows the `openssl` commands that convert it); SSH tunnels through
+  the system `ssh` (your `~/.ssh/config`, agents and ProxyJump work); passwords in the Keychain;
+  `redis://` URL paste; import from Redis Insight; read-only and production markers.
 - **Key Browser**: list and namespace-tree views over millions of keys, filtering by pattern and
   type, editors for strings, hashes (with field TTLs), lists, sets, sorted sets, streams (with
   consumer groups) and JSON; rename, TTL, delete with undo, bulk delete.
