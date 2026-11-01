@@ -108,6 +108,10 @@ public enum PubSubEvent: Sendable {
     case subscribed(count: Int)
     case connectionLost(String)
     case resubscribed
+    /// The server refused a subscription command (an ACL denial, say), prefixed with the node for
+    /// sharded channels. Nothing from that command is subscribed; the listener keeps running, so the
+    /// owner decides whether to stop it.
+    case refused(String)
 }
 
 /// Owns the subscriber connection(s) of a session. Classic SUBSCRIBE/PSUBSCRIBE use one
@@ -130,6 +134,10 @@ public actor PubSubListener {
     /// A new reader dropped while a reconnect attempt was still subscribing the others.
     private var droppedWhileReconnecting = false
     private var isStopped = false
+    /// The latest `subscribe` or `stop`. Each waits for the one before it: the actor is reentrant,
+    /// so a `stop` arriving while `subscribe` connects to its nodes could otherwise run in the middle
+    /// and leave the nodes connected after it subscribed.
+    private var lastChange: Task<Void, any Error>?
 
     public init(session: RedisSession) {
         self.session = session
@@ -140,6 +148,26 @@ public actor PubSubListener {
 
     /// Replaces the current subscriptions.
     public func subscribe(channels: [String], patterns: [String], sharded: [String] = []) async throws {
+        try await afterLastChange {
+            try await $0.performSubscribe(channels: channels, patterns: patterns, sharded: sharded)
+        }
+    }
+
+    public func stop() async {
+        try? await afterLastChange { await $0.performStop() }
+    }
+
+    private func afterLastChange(_ change: @escaping @Sendable (isolated PubSubListener) async throws -> Void) async throws {
+        let previous = lastChange
+        let task = Task {
+            _ = await previous?.result
+            try await change(self)
+        }
+        lastChange = task
+        try await task.value
+    }
+
+    private func performSubscribe(channels: [String], patterns: [String], sharded: [String]) async throws {
         isReconfiguring = true
         defer { isReconfiguring = false }
         await cancelReconnect()
@@ -151,7 +179,7 @@ public actor PubSubListener {
         try await start()
     }
 
-    public func stop() async {
+    private func performStop() async {
         isStopped = true
         isReconfiguring = true
         defer { isReconfiguring = false }
@@ -220,6 +248,10 @@ public actor PubSubListener {
             for await value in connection.pushes {
                 if let message = PubSubMessage.parse(value) {
                     batcher.append(message)
+                } else if let error = value.serverError {
+                    // A subscriber connection sends nothing that expects a reply, so any error is
+                    // the answer to one of its subscription commands.
+                    continuation.yield(.refused(node.map { "\($0): \(error)" } ?? error.description))
                 } else if let parts = value.array, let kind = parts.first?.string, kind.hasSuffix("subscribe"), let count = parts.last?.int {
                     continuation.yield(.subscribed(count: Int(count)))
                 }

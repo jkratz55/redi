@@ -79,6 +79,8 @@ final class BrowserModel {
         generation += 1
         scanTask?.cancel()
         metadataTask?.cancel()
+        // Made afresh on each reload, so it walks the session's current primaries.
+        scanner = nil
         index = KeyIndex()
         tree = KeyTree(delimiter: workspace.keyDelimiter)
         deduplicator.removeAll()
@@ -156,11 +158,23 @@ final class BrowserModel {
                 self.isScanComplete = self.cursor.isComplete
                 if self.isScanComplete, let size = self.databaseSize { self.approximateScanned = size }
             } catch is CancellationError {
+            } catch ScanError.topologyChanged {
+                guard let self, self.generation == scanning else { return }
+                self.workspace.show(notice: String(localized: "The server's primaries changed, so the key list was reloaded."))
+                self.reload()
             } catch {
                 guard let self, self.generation == scanning else { return }
                 self.error = String(describing: error)
             }
         }
+    }
+
+    /// Called on a failover or topology refresh. A scan cursor only means something on the nodes it
+    /// came from, so when the primaries changed the key list starts over; a refresh that kept the
+    /// same primaries (after a MOVED, say) leaves browsing alone.
+    func topologyDidChange() async {
+        guard let scanner, !(await scanner.isCurrent()), self.scanner?.nodes == scanner.nodes else { return }
+        reload()
     }
 
     /// Adds new (deduplicated) keys as one page. Returns how many were new.
@@ -269,18 +283,83 @@ final class BrowserModel {
         metadataRevision += 1
     }
 
+    // MARK: Deleting
+
+    /// A delete waiting for the user to confirm it. It names keys rather than rows, and remembers the
+    /// key list it came from: if the list is reloaded meanwhile (a database switch, a failover), the
+    /// request is dropped instead of deleting same-named keys somewhere else.
+    struct DeleteRequest: Equatable {
+        let keys: [[UInt8]]
+        /// Whether ⌘Z will be able to restore the keys, as far as the loaded sizes tell.
+        let canUndo: Bool
+        fileprivate let generation: Int
+    }
+
+    /// The one delete policy, for the key list and the detail pane alike: a single small key that can
+    /// be restored with undo is deleted straight away (HIG: prefer undo over alerts), except on a
+    /// production connection; anything else is confirmed first.
+    static func deleteNeedsConfirmation(sizes: [Int64?], undoLimitKB: Int, isProduction: Bool) -> Bool {
+        sizes.count != 1 || isProduction || !canUndoDelete(sizes: sizes, undoLimitKB: undoLimitKB)
+    }
+
+    /// Whether every key is small enough to snapshot for undo. An unknown size counts as too big.
+    static func canUndoDelete(sizes: [Int64?], undoLimitKB: Int) -> Bool {
+        undoLimitKB > 0 && sizes.count <= 100 && sizes.allSatisfy { ($0 ?? .max) <= Int64(undoLimitKB) * 1024 }
+    }
+
+    private var undoLimitKB: Int {
+        UserDefaults.standard.object(forKey: SettingsKey.undoDeleteSizeLimitKB) as? Int ?? 1024
+    }
+
+    /// Deletes `rows` now when the policy allows, or returns the request for the caller to confirm.
+    func requestDelete(rows: [Int], undoManager: UndoManager?) -> DeleteRequest? {
+        let sizes = rows.map { metadata[$0]?.memory }
+        let request = DeleteRequest(keys: rows.map { Array(index.key(at: $0)) },
+                                    canUndo: Self.canUndoDelete(sizes: sizes, undoLimitKB: undoLimitKB), generation: generation)
+        guard Self.deleteNeedsConfirmation(sizes: sizes, undoLimitKB: undoLimitKB, isProduction: isProduction) else {
+            Task { await delete(keys: request.keys, undoManager: undoManager) }
+            return nil
+        }
+        return request
+    }
+
+    /// The detail pane's Delete: the same policy, applied to the row showing `key`. A key with no
+    /// loaded row has no known size, so it's always confirmed.
+    func requestDelete(key: [UInt8], undoManager: UndoManager?) -> DeleteRequest? {
+        if let row = row(showing: key) { return requestDelete(rows: [row], undoManager: undoManager) }
+        return DeleteRequest(keys: [key], canUndo: false, generation: generation)
+    }
+
+    func confirmDelete(_ request: DeleteRequest, undoManager: UndoManager?) async {
+        guard request.generation == generation else {
+            workspace.show(notice: String(localized: "The key list was reloaded before the delete ran, so nothing was deleted."))
+            return
+        }
+        await delete(keys: request.keys, undoManager: undoManager)
+    }
+
+    private func row(showing key: [UInt8]) -> Int? {
+        if let selectedIndex, selectedIndex < index.count, index.key(at: selectedIndex).elementsEqual(key) { return selectedIndex }
+        return (0..<index.count).first { index.key(at: $0).elementsEqual(key) }
+    }
+
     /// Deletes keys, with undo when every key is small enough to snapshot.
-    func delete(rows: [Int], undoManager: UndoManager?) async {
+    private func delete(keys: [[UInt8]], undoManager: UndoManager?) async {
         guard let session else { return }
-        let keys = rows.map { Array(index.key(at: $0)) }
+        let requested = generation
         let ops = KeyOperations(session: session)
-        let limitKB = UserDefaults.standard.object(forKey: SettingsKey.undoDeleteSizeLimitKB) as? Int ?? 1024
         var snapshots: [KeyOperations.Snapshot] = []
-        if limitKB > 0, keys.count <= 100 {
+        if undoLimitKB > 0, keys.count <= 100 {
+            // Fresh sizes: the loaded ones may be stale, or missing for a key shown without a row.
             let sizes = (try? await KeyMetadata.load(keys, session: session)) ?? []
-            if sizes.count == keys.count, sizes.allSatisfy({ ($0.memory ?? .max) <= Int64(limitKB) * 1024 }) {
+            if sizes.count == keys.count, Self.canUndoDelete(sizes: sizes.map(\.memory), undoLimitKB: undoLimitKB) {
                 for key in keys { if let snapshot = try? await ops.snapshot(key) { snapshots.append(snapshot) } }
             }
+        }
+        // A database switch while snapshotting would aim the DEL at another database's keys.
+        guard generation == requested else {
+            workspace.show(notice: String(localized: "The key list was reloaded before the delete ran, so nothing was deleted."))
+            return
         }
         do {
             try await ops.delete(keys)
@@ -291,12 +370,6 @@ final class BrowserModel {
         } catch {
             workspace.show(notice: String(describing: error))
         }
-    }
-
-    func canUndoDelete(rows: [Int]) -> Bool {
-        let limitKB = UserDefaults.standard.object(forKey: SettingsKey.undoDeleteSizeLimitKB) as? Int ?? 1024
-        guard limitKB > 0, rows.count <= 100 else { return false }
-        return rows.allSatisfy { (metadata[$0]?.memory ?? .max) <= Int64(limitKB) * 1024 }
     }
 
     private func registerUndo(_ snapshots: [KeyOperations.Snapshot], undoManager: UndoManager) {

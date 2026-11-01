@@ -88,6 +88,10 @@ final class CLIModel {
         }
         guard let first = arguments.first else { return }
         let name = String(decoding: first, as: UTF8.self).lowercased()
+        if let command = CommandSafety.connectionCommand(arguments) {
+            append(Entry(prompt: prompt, command: line, output: Self.unavailableMessage(for: command), kind: .info))
+            return
+        }
 
         switch name {
         case "clear":
@@ -96,17 +100,15 @@ final class CLIModel {
         case "help":
             append(Entry(prompt: prompt, command: line, output: help(for: arguments.dropFirst().map { String(decoding: $0, as: UTF8.self) }), kind: .info))
             return
-        case "hello", "reset", "quit", "auth":
-            append(Entry(prompt: prompt, command: line,
-                         output: String(localized: "\(name.uppercased()) isn't available in Redi's CLI; change credentials or protocol in the connection settings."),
-                         kind: .info))
-            return
         case "select" where arguments.count == 2:
             guard let index = Int(String(decoding: arguments[1], as: UTF8.self)) else { break }
             Task {
-                await workspace.selectDatabase(index)
-                append(Entry(prompt: prompt, command: line, output: workspace.database == index ? "OK" : "(error) Couldn't select database \(index)",
-                             kind: workspace.database == index ? .output : .error))
+                do {
+                    try await workspace.switchDatabase(index)
+                    append(Entry(prompt: prompt, command: line, output: "OK", kind: .output))
+                } catch {
+                    append(Entry(prompt: prompt, command: line, output: "(error) \(error)", kind: .error))
+                }
             }
             return
         default:
@@ -133,6 +135,11 @@ final class CLIModel {
             }
             execute(arguments, line: line, prompt: prompt)
         }
+    }
+
+    /// Why a `CommandSafety.connectionCommand` isn't run, shared with the Workbench.
+    static func unavailableMessage(for command: String) -> String {
+        String(localized: "\(command) isn't available here: Redi sets up each connection's login, protocol and replies from the connection settings.")
     }
 
     private var confirmsDangerousCommands: Bool {

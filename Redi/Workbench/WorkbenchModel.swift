@@ -71,17 +71,36 @@ final class WorkbenchModel {
 
     enum Preflight: Equatable {
         case run
+        /// The batch is a lone `SELECT n`: switch the whole window, like the toolbar.
+        case selectDatabase(Int)
         case confirm(title: String, message: String)
         case reject(String)
     }
 
-    /// Decides whether a batch runs. Streaming commands are always rejected: their replies arrive
-    /// as pushes (or never stop), which the request/reply connection can't pair with commands.
+    /// Decides whether a batch runs. Always rejected, whatever the settings:
+    /// - streaming commands: their replies arrive as pushes (or never stop), which the request/reply
+    ///   connection can't pair with commands;
+    /// - commands that change the connection's login, protocol or replies (see
+    ///   `CommandSafety.connectionCommand`);
+    /// - SELECT alongside other commands. A lone `SELECT n` switches the window's database instead
+    ///   of only the Workbench's connection, which would leave the toolbar, the browser and every
+    ///   later Workbench command disagreeing about which database they're in.
+    ///
     /// The confirmation setting, and confirming once, only cover the destructive/expensive prompt.
     static func preflight(_ batch: [[[UInt8]]], table: CommandTable, confirmed: Bool, confirmsDangerousCommands: Bool) -> Preflight {
         let classifications = batch.map { CommandSafety.classify($0, table: table) }
         if classifications.contains(where: { if case .streaming = $0 { true } else { false } }) {
             return .reject(String(localized: "SUBSCRIBE and MONITOR stream continuously; use Pub/Sub or the Profiler."))
+        }
+        if let command = batch.lazy.compactMap(CommandSafety.connectionCommand).first {
+            return .reject(CLIModel.unavailableMessage(for: command))
+        }
+        if let select = batch.first(where: { $0.first.map { String(decoding: $0, as: UTF8.self).lowercased() } == "select" }) {
+            guard batch.count == 1 else {
+                return .reject(String(localized: "SELECT switches the whole window's database; run it on its own."))
+            }
+            // A malformed SELECT goes to the server, which refuses it without switching anything.
+            if select.count == 2, let index = Int(String(decoding: select[1], as: UTF8.self)) { return .selectDatabase(index) }
         }
         guard !confirmed, confirmsDangerousCommands else { return .run }
         for (arguments, classification) in zip(batch, classifications) {
@@ -120,6 +139,9 @@ final class WorkbenchModel {
             case .reject(let message):
                 record(commands: commands.map(\.line), text: message, isError: true, duration: .zero, reply: nil)
                 return
+            case .selectDatabase(let index):
+                await selectDatabase(index, command: commands[0].line)
+                return
             }
             isRunning = true
             defer { isRunning = false }
@@ -152,6 +174,19 @@ final class WorkbenchModel {
             } catch {
                 record(commands: display, text: "(error) \(error)", isError: true, duration: clock.now - started, reply: nil)
             }
+        }
+    }
+
+    private func selectDatabase(_ index: Int, command: String) async {
+        isRunning = true
+        defer { isRunning = false }
+        let clock = ContinuousClock()
+        let started = clock.now
+        do {
+            try await workspace.switchDatabase(index)
+            record(commands: [command], text: "OK", isError: false, duration: clock.now - started, reply: nil)
+        } catch {
+            record(commands: [command], text: "(error) \(error)", isError: true, duration: clock.now - started, reply: nil)
         }
     }
 

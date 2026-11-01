@@ -74,11 +74,14 @@ final class OverviewModel {
             var snapshots: [InfoSnapshot] = []
             switch scope {
             case .allPrimaries:
-                for reply in try await session.fanOut(RedisCommand("INFO"), role: .background) {
+                // One refused node fails the sample: partial totals would pass for the whole server.
+                let replies = try await session.fanOut(RedisCommand("INFO"), role: .background)
+                try replies.throwIfAnyError()
+                for reply in replies {
                     snapshots.append(snapshot(reply.reply, node: reply.node, date: date))
                 }
             case .node(let node):
-                snapshots.append(snapshot(try await session.send(RedisCommand("INFO"), role: .background, target: .node(node)), node: node, date: date))
+                snapshots.append(snapshot(try await session.execute(RedisCommand("INFO"), role: .background, target: .node(node)), node: node, date: date))
             }
             guard let combined = InfoSnapshot.combine(snapshots) else { return }
             samples.append(combined)

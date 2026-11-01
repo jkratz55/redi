@@ -127,3 +127,55 @@ struct CommandEditorCaretTests {
         #expect(caret.selection == "")
     }
 }
+
+/// A typed SELECT must move the whole window, not only the connection it was typed on.
+@MainActor
+@Suite(.serialized, .enabled(if: RedisServerFixture.isAvailable))
+struct TypedSelectTests {
+    @Test func workbenchSelectSwitchesTheWindow() async throws {
+        let server = try await RedisServerFixture()
+        let profile = ConnectionProfile(port: server.port)
+        defer { removeConnectionData(profile) }
+        let workspace = WorkspaceModel(profile: profile, secrets: ConnectionSecrets())
+        await workspace.connect()
+        let workbench = workspace.workbench
+        workbench.clearResults()
+
+        workbench.run("SELECT 1")
+        try await waitUntil { workbench.results.count == 1 }
+        #expect(workbench.results.first?.text == "OK")
+        #expect(workspace.database == 1, "the toolbar follows")
+
+        workbench.run("SET typed-select-key db1")
+        try await waitUntil { workbench.results.count == 2 }
+        let admin = try await RedisConnection.connect(server.configuration(database: 1))
+        #expect(try await admin.send(RedisCommand("GET", "typed-select-key")).string == "db1")
+
+        workbench.run("SELECT 99")
+        try await waitUntil { workbench.results.count == 3 }
+        #expect(workbench.results.first?.isError == true)
+        #expect(workspace.database == 1, "a refused SELECT changes nothing")
+        await workspace.disconnect()
+        await admin.close()
+    }
+
+    @Test func cliSelectSwitchesTheWindow() async throws {
+        let server = try await RedisServerFixture()
+        let profile = ConnectionProfile(port: server.port)
+        defer { removeConnectionData(profile) }
+        let workspace = WorkspaceModel(profile: profile, secrets: ConnectionSecrets())
+        await workspace.connect()
+        let cli = workspace.cli
+        cli.clear()
+        cli.run("SELECT 2", confirmed: false)
+        try await waitUntil { cli.entries.count == 1 }
+        #expect(cli.entries.last?.output == "OK")
+        #expect(workspace.database == 2)
+        cli.run("SELECT 99", confirmed: false)
+        try await waitUntil { cli.entries.count == 2 }
+        #expect(cli.entries.last?.kind == .error)
+        #expect(cli.entries.last?.output.contains("out of range") == true)
+        #expect(workspace.database == 2)
+        await workspace.disconnect()
+    }
+}

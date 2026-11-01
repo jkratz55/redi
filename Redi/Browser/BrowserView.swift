@@ -6,7 +6,7 @@ struct BrowserView: View {
     @Bindable var model: BrowserModel
     @Environment(\.undoManager) private var undoManager
     @FocusState private var isFilterFocused: Bool
-    @State private var pendingDelete: [Int] = []
+    @State private var pendingDelete: BrowserModel.DeleteRequest?
     @State private var isAddingKey = false
     @State private var isBulkDeleting = false
 
@@ -21,14 +21,14 @@ struct BrowserView: View {
         .task {
             if model.index.count == 0, !model.isScanning { model.reload() }
         }
-        .confirmationDialog(deleteTitle, isPresented: Binding(get: { !pendingDelete.isEmpty }, set: { if !$0 { pendingDelete = [] } })) {
+        .confirmationDialog(deleteTitle, isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+                            presenting: pendingDelete) { request in
             Button("Delete", role: .destructive) {
-                let rows = pendingDelete
-                pendingDelete = []
-                Task { await model.delete(rows: rows, undoManager: undoManager) }
+                pendingDelete = nil
+                Task { await model.confirmDelete(request, undoManager: undoManager) }
             }
-        } message: {
-            Text(model.canUndoDelete(rows: pendingDelete) ? "You can undo this with ⌘Z." : "This can't be undone.")
+        } message: { request in
+            Text(request.canUndo ? "You can undo this with ⌘Z." : "This can't be undone.")
         }
         .sheet(isPresented: $isAddingKey) {
             AddKeySheet(model: model)
@@ -40,19 +40,16 @@ struct BrowserView: View {
     }
 
     private var deleteTitle: String {
-        if pendingDelete.count == 1, let row = pendingDelete.first, row < model.index.count {
-            return String(localized: "Delete “\(model.key(at: row).displayText)”?")
+        guard let keys = pendingDelete?.keys else { return "" }
+        if keys.count == 1, let key = keys.first {
+            return String(localized: "Delete “\(key.displayText)”?")
         }
-        return String(localized: "Delete \(pendingDelete.count) keys?")
+        return String(localized: "Delete \(keys.count) keys?")
     }
 
-    /// Small, undoable deletes skip the confirmation (HIG: prefer undo over alerts).
+    /// `BrowserModel` decides whether to confirm, for the key list and the detail pane alike.
     private func requestDelete(_ rows: [Int]) {
-        if model.canUndoDelete(rows: rows) && rows.count == 1 && !model.workspaceIsProduction {
-            Task { await model.delete(rows: rows, undoManager: undoManager) }
-        } else {
-            pendingDelete = rows
-        }
+        pendingDelete = model.requestDelete(rows: rows, undoManager: undoManager)
     }
 
     // MARK: - Key pane
@@ -200,8 +197,10 @@ struct BrowserView: View {
 
     @ViewBuilder private var detailPane: some View {
         if let detail = model.detail {
-            KeyDetailView(model: detail)
-                .id(detail.key)
+            KeyDetailView(model: detail) {
+                pendingDelete = model.requestDelete(key: detail.key, undoManager: undoManager)
+            }
+            .id(detail.key)
         } else {
             ContentUnavailableView("No Key Selected", systemImage: "key",
                                    description: Text("Select a key to see and edit its value."))
@@ -211,10 +210,6 @@ struct BrowserView: View {
 
 extension Notification.Name {
     static let focusKeyFilter = Notification.Name("com.github.jkratz55.Redi.focusKeyFilter")
-}
-
-extension BrowserModel {
-    var workspaceIsProduction: Bool { isProduction }
 }
 
 // MARK: - Add key

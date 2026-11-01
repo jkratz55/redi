@@ -165,14 +165,21 @@ final class WorkspaceModel {
     }
 
     func selectDatabase(_ index: Int) async {
-        guard let session, index != database else { return }
         do {
-            try await session.select(database: index)
-            database = index
-            browserModel?.databaseDidChange()
+            try await switchDatabase(index)
         } catch {
             show(notice: String(describing: error))
         }
+    }
+
+    /// Moves every connection, the toolbar and the browser to database `index`, or throws the
+    /// server's refusal and changes nothing. The CLI and the Workbench run a typed `SELECT` through
+    /// this, so it can't move just their own connection.
+    func switchDatabase(_ index: Int) async throws {
+        guard let session, index != database else { return }
+        try await session.select(database: index)
+        database = index
+        browserModel?.databaseDidChange()
     }
 
     func show(notice text: String) {
@@ -213,8 +220,10 @@ final class WorkspaceModel {
                 case .failover(let endpoint):
                     self.primaryAddress = endpoint.description
                     self.show(notice: String(localized: "Sentinel failover: now connected to the new primary at \(endpoint.description)."))
+                    await self.browserModel?.topologyDidChange()
                 case .topologyChanged:
                     await self.refreshTopologyState()
+                    await self.browserModel?.topologyDidChange()
                 }
             }
         }

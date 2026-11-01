@@ -59,7 +59,22 @@ public struct ScanResult: Sendable {
     public var iterations: Int
 }
 
+public enum ScanError: Error, Sendable, Hashable, CustomStringConvertible {
+    /// The session's primaries changed (a Sentinel failover, or cluster nodes added, removed or
+    /// promoted) since the scanner was made. Its cursor belongs to nodes that are no longer the
+    /// primaries, so the scan has to start over with a new scanner.
+    case topologyChanged
+
+    public var description: String {
+        switch self {
+        case .topologyChanged: "The server's primaries changed during the scan."
+        }
+    }
+}
+
 /// Incremental SCAN over a session, collecting at least `target` keys per call (or finishing).
+/// A scanner is fixed to the primaries at the time it's made; once they change it throws
+/// `ScanError.topologyChanged` rather than reading a demoted or departed node.
 public struct KeyScanner: Sendable {
     public let session: RedisSession
     public let nodes: [RedisEndpoint]
@@ -72,13 +87,25 @@ public struct KeyScanner: Sendable {
         serverSupportsTypeFilter = version >= ServerVersion(6)
     }
 
-    /// Sum of DBSIZE across primaries.
+    /// Sum of DBSIZE across primaries. Throws the server's error (an ACL denial, say) rather than
+    /// counting a refused node as empty.
     public func databaseSize() async throws -> Int {
+        try await requireCurrentTopology()
         var total = 0
         for node in nodes {
-            total += Int(try await session.send(RedisCommand("DBSIZE"), role: .scan, target: .node(node)).int ?? 0)
+            total += Int(try await session.execute(RedisCommand("DBSIZE"), role: .scan, target: .node(node)).int ?? 0)
         }
         return total
+    }
+
+    /// Whether the session's primaries are still the ones this scanner walks. Order doesn't matter:
+    /// the cursor indexes the scanner's own `nodes`.
+    public func isCurrent() async -> Bool {
+        Set(await session.primaries()) == Set(nodes)
+    }
+
+    private func requireCurrentTopology() async throws {
+        guard await isCurrent() else { throw ScanError.topologyChanged }
     }
 
     /// Looks up a single key directly, so searching for an exact name is instant on any database size.
@@ -100,6 +127,7 @@ public struct KeyScanner: Sendable {
         while !cursor.isComplete, keys.count < target, iterations < maxIterations {
             iterations += 1
             try Task.checkCancellation()
+            try await requireCurrentTopology()
             var command = RedisCommand("SCAN", cursor.cursor)
             if let match = filter.matchPattern {
                 command.append("MATCH")

@@ -4,7 +4,8 @@ import SwiftUI
 /// Header (type, name, TTL, size) and type-specific editor for the selected key.
 struct KeyDetailView: View {
     @Bindable var model: KeyDetailModel
-    @Environment(\.undoManager) private var undoManager
+    /// Deletes the key through the browser, which applies the same confirmation policy as the list.
+    var onDelete: () -> Void = {}
     @State private var isRenaming = false
     @State private var newName = ""
     @State private var isEditingTTL = false
@@ -91,7 +92,7 @@ struct KeyDetailView: View {
             .disabled(model.isReadOnly)
             .popover(isPresented: $isRenaming) { renameEditor }
             Button("Refresh", systemImage: "arrow.clockwise") { Task { await model.load() } }
-            Button("Delete", systemImage: "trash") { Task { await model.delete(undoManager: undoManager) } }
+            Button("Delete", systemImage: "trash", action: onDelete)
                 .disabled(model.isReadOnly)
         }
         .labelStyle(.iconOnly)

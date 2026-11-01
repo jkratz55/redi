@@ -81,6 +81,29 @@ struct WorkbenchPreflightTests {
         #expect(try preflight("GET k", "FLUSHDB", confirms: false) == .run)
         #expect(try preflight("GET k", "SET k v") == .run)
     }
+
+    /// SELECT on the Workbench's own connection would leave the toolbar and browser in another
+    /// database; a lone SELECT switches the window instead, and SELECT inside a batch is refused.
+    @Test func selectSwitchesTheWindowOrIsRejected() throws {
+        #expect(try preflight("SELECT 3") == .selectDatabase(3))
+        #expect(try preflight("select 0", confirmed: true) == .selectDatabase(0))
+        #expect(isRejected(try preflight("SELECT 1", "SET k v")))
+        #expect(isRejected(try preflight("MULTI", "SELECT 1", "EXEC")))
+        #expect(isRejected(try preflight("SELECT 1", "SELECT 1")), "a repeated SELECT (2 SELECT 1) is a batch too")
+        // Malformed: the server answers with its own error and switches nothing.
+        #expect(try preflight("SELECT one") == .run)
+    }
+
+    @Test func connectionCommandsAreRejectedWhateverTheConfirmationSetting() throws {
+        for confirmed in [true, false] {
+            for line in ["AUTH secret", "auth user secret", "HELLO 2", "RESET", "QUIT", "CLIENT REPLY OFF", "client reply skip"] {
+                #expect(isRejected(try preflight(line, confirmed: confirmed)), "\(line)")
+                #expect(isRejected(try preflight("GET k", line, confirmed: confirmed)), "\(line) in a batch")
+            }
+        }
+        #expect(try preflight("CLIENT LIST") == .run)
+        #expect(try preflight("CLIENT SETNAME me") == .run)
+    }
 }
 
 /// Stores secrets in memory; `failNextWrite` makes one write store only the password and then

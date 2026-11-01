@@ -68,6 +68,22 @@ public enum CommandSafety {
         return .normal
     }
 
+    /// The command's display name ("AUTH", "CLIENT REPLY") when it changes how a connection logs in,
+    /// speaks or replies. Redi sets those up itself on every connection it opens, from the profile,
+    /// and a typed one would only affect the one connection it reaches, or stop it pairing replies
+    /// with commands (CLIENT REPLY OFF). The CLI and the Workbench refuse these.
+    public static func connectionCommand(_ arguments: [[UInt8]]) -> String? {
+        guard let first = arguments.first else { return nil }
+        let name = String(decoding: first, as: UTF8.self).lowercased()
+        if connectionCommands.contains(name) { return name.uppercased() }
+        if name == "client", arguments.count > 1, String(decoding: arguments[1], as: UTF8.self).lowercased() == "reply" {
+            return "CLIENT REPLY"
+        }
+        return nil
+    }
+
+    static let connectionCommands: Set<String> = ["auth", "hello", "reset", "quit"]
+
     public enum ReadOnlyCheck: Sendable, Hashable {
         case allowed
         /// Changes data or server state.

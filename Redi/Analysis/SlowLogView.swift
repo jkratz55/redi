@@ -26,9 +26,11 @@ final class SlowLogModel {
         defer { isLoading = false }
         do {
             let replies = try await session.fanOut(RedisCommand("SLOWLOG", "GET", count))
+            try replies.throwIfAnyError()
             let isCluster = replies.count > 1
             entries = replies.flatMap { SlowLogEntry.parse($0.reply, node: isCluster ? $0.node.description : nil) }
                 .sorted { $0.date > $1.date }
+            // Best effort: managed services often disable CONFIG, and it only feeds the settings shown.
             if let config = try? await session.send(RedisCommand("CONFIG", "GET", "slowlog-*")), let pairs = config.pairs {
                 for pair in pairs {
                     switch pair.key.string {
@@ -47,9 +49,8 @@ final class SlowLogModel {
     func configure(threshold: Int64, maxLength: Int64) async {
         guard let session = workspace.session else { return }
         do {
-            for reply in try await session.fanOut(RedisCommand("CONFIG", "SET", "slowlog-log-slower-than", threshold, "slowlog-max-len", maxLength)) {
-                try reply.reply.throwIfError()
-            }
+            try await session.fanOut(RedisCommand("CONFIG", "SET", "slowlog-log-slower-than", threshold, "slowlog-max-len", maxLength))
+                .throwIfAnyError()
             await load()
         } catch {
             self.error = String(describing: error)
@@ -59,7 +60,7 @@ final class SlowLogModel {
     func reset() async {
         guard let session = workspace.session else { return }
         do {
-            for reply in try await session.fanOut(RedisCommand("SLOWLOG", "RESET")) { try reply.reply.throwIfError() }
+            try await session.fanOut(RedisCommand("SLOWLOG", "RESET")).throwIfAnyError()
             await load()
         } catch {
             self.error = String(describing: error)

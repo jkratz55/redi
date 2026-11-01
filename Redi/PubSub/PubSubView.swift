@@ -48,32 +48,44 @@ final class PubSubModel {
         return (names.filter { !$0.contains(where: { "*?[".contains($0) }) }, names.filter { $0.contains(where: { "*?[".contains($0) }) })
     }
 
+    /// Shows "Subscribing…" until the server confirms. SUBSCRIBE gets no direct reply, so a refusal
+    /// arrives later as a `.refused` event, which ends the subscription.
     func subscribe() async {
-        guard let session = workspace.session else { return }
+        guard let session = workspace.session, !isSubscribed else { return }
         let (channels, patterns) = parsedSubscriptions
         guard !channels.isEmpty || !patterns.isEmpty else { return }
         let listener = self.listener ?? PubSubListener(session: session)
         self.listener = listener
         startEvents(listener)
+        isSubscribed = true
+        status = String(localized: "Subscribing…")
         do {
             if isSharded {
                 try await listener.subscribe(channels: [], patterns: [], sharded: channels)
             } else {
                 try await listener.subscribe(channels: channels, patterns: patterns)
             }
-            isSubscribed = true
-            status = String(localized: "Subscribed")
         } catch {
-            status = String(describing: error)
+            await stopListening(status: String(describing: error))
         }
     }
 
     func unsubscribe() async {
-        await listener?.stop()
+        await stopListening(status: nil)
+    }
+
+    /// Stops the listener and drops it: cancelling `eventTask` ends the listener's event stream for
+    /// good, so the next Subscribe needs a new listener. `isSubscribed` stays set until the old
+    /// listener has released its connection, so a new subscription can't start before then.
+    private func stopListening(status: String?) async {
+        self.status = status
+        guard let listener else { return }
+        await listener.stop()
+        guard self.listener === listener else { return }
+        self.listener = nil
         eventTask?.cancel()
         eventTask = nil
         isSubscribed = false
-        status = nil
         ratePerSecond = 0
     }
 
@@ -87,6 +99,7 @@ final class PubSubModel {
                 case .subscribed(let count): self.status = String(localized: "Subscribed (\(count))")
                 case .connectionLost: self.status = String(localized: "Connection lost — reconnecting…")
                 case .resubscribed: self.status = String(localized: "Reconnected and resubscribed")
+                case .refused(let message): await self.stopListening(status: message)
                 }
             }
         }

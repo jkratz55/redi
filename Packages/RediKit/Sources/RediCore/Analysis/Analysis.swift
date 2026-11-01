@@ -226,7 +226,7 @@ public struct MemoryAnalyzer: Sendable {
         let nodes = node.map { [$0] } ?? primaries
         var total = 0
         for node in nodes {
-            total += Int(try await session.send(RedisCommand("DBSIZE"), role: .background, target: .node(node)).int ?? 0)
+            total += Int(try await session.execute(RedisCommand("DBSIZE"), role: .background, target: .node(node)).int ?? 0)
         }
         let limit = sampleLimit.map { min($0, total) } ?? total
         var accumulator = Accumulator()

@@ -125,6 +125,13 @@ public actor RedisSession {
         public var reply: RESPValue
     }
 
+    /// A server error from one node of several, so the message says which node refused.
+    public struct NodeError: Error, Sendable, Hashable, CustomStringConvertible {
+        public var node: RedisEndpoint
+        public var error: RedisServerError
+        public var description: String { "\(node): \(error)" }
+    }
+
     public nonisolated let configuration: RedisConnectionConfiguration
     public nonisolated let options: Options
     public nonisolated let events: AsyncStream<Event>
@@ -806,5 +813,17 @@ extension RedisEndpoint {
     public var port: Int? {
         if case .tcp(_, let port) = self { return port }
         return nil
+    }
+}
+
+extension [RedisSession.NodeReply] {
+    /// Throws the first error reply, so a refused node (an ACL denial, say) isn't read as an empty
+    /// result. With several nodes the error names its node (`RedisSession.NodeError`).
+    public func throwIfAnyError() throws {
+        for reply in self {
+            guard let error = reply.reply.serverError else { continue }
+            if count > 1 { throw RedisSession.NodeError(node: reply.node, error: error) }
+            throw error
+        }
     }
 }

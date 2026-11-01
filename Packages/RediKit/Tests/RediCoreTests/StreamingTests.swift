@@ -109,14 +109,17 @@ private final class TransportLog: Sendable {
 
 /// A session whose connections are scripted transports. Transport 0 is the command connection and
 /// transport 1 the first subscriber; `failing` lists the transports that refuse every command, so
-/// connecting through them fails.
-private func scriptedPubSubSession(failing: Set<Int>) -> (RedisSession, TransportLog) {
+/// connecting through them fails. With `refusingSubscribe`, SUBSCRIBE gets an ACL error.
+private func scriptedPubSubSession(failing: Set<Int>, refusingSubscribe: Bool = false) -> (RedisSession, TransportLog) {
     let log = TransportLog()
     let session = RedisSession(configuration: .init(endpoint: .tcp(host: "scripted", port: 6379)), transportFactory: { _ in
         let base = ScriptedTransport.minimalServer()
         let index = Mutex(0)
         let transport = ScriptedTransport { arguments in
             if failing.contains(index.withLock { $0 }) { return .error(RedisServerError("ERR simulated outage")) }
+            if arguments.first == "SUBSCRIBE", refusingSubscribe {
+                return .error(RedisServerError("NOPERM User review has no permissions to run the 'subscribe' command"))
+            }
             if arguments.first == "SUBSCRIBE" { return .push(["subscribe", .bulkString(Array(arguments[1].utf8)), 1]) }
             return base(arguments)
         }
@@ -125,6 +128,25 @@ private func scriptedPubSubSession(failing: Set<Int>) -> (RedisSession, Transpor
         return transport
     })
     return (session, log)
+}
+
+@Suite("Pub/Sub refusals")
+struct PubSubRefusalTests {
+    @Test("A refused SUBSCRIBE is reported instead of being ignored", .timeLimit(.minutes(1)))
+    func refusedSubscribe() async throws {
+        let (session, _) = scriptedPubSubSession(failing: [], refusingSubscribe: true)
+        let listener = PubSubListener(session: session)
+        var events = listener.events.makeAsyncIterator()
+        try await listener.subscribe(channels: ["news"], patterns: [])
+        let event = await events.next()
+        guard case .refused(let message) = event else {
+            Issue.record("expected a refusal, got \(String(describing: event))")
+            return
+        }
+        #expect(message.hasPrefix("NOPERM"))
+        await listener.stop()
+        await session.close()
+    }
 }
 
 @Suite("Pub/Sub reconnection", .serialized)

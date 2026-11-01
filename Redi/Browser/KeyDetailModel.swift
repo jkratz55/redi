@@ -129,17 +129,6 @@ final class KeyDetailModel {
         }
     }
 
-    func delete(undoManager: UndoManager?) async {
-        guard let browser, let row = browser.selectedIndex else {
-            do {
-                try await ops.delete([key])
-                browser?.markDeleted(key)
-            } catch { report(error) }
-            return
-        }
-        await browser.delete(rows: [row], undoManager: undoManager)
-    }
-
     func openInCLI(_ command: String) {
         browser?.openInCLI(command: command)
     }
