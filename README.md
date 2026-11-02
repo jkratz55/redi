@@ -20,6 +20,12 @@ Swift, SwiftUI and AppKit.
 
 See [docs/perf.md](docs/perf.md) for performance budgets and measurements.
 
+## Installing
+
+Download the DMG from the [latest release](https://github.com/jkratz55/redi/releases/latest), open it
+and drag Redi to Applications. Redi needs macOS 27.2 or later. Builds are signed with Developer ID and
+notarized by Apple, and Redi checks for updates itself (Redi ▸ Check for Updates…).
+
 ## Layout
 
 ```
@@ -54,6 +60,14 @@ Scripts/seed.sh 1000000 6379
 
 ## Releasing
 
-`Scripts/release.sh <version> <build>` archives, signs with Developer ID, notarizes, staples and
-builds a DMG, then signs it for Sparkle. Read the header of the script for one-time setup: the notary
-profile and the Sparkle EdDSA keys. The updater stays disabled until `REDI_SPARKLE_PUBLIC_KEY` is set.
+```sh
+Scripts/release.sh 1.1 --dry-run              # build, sign and package only, to check the build
+Scripts/release.sh 1.1 --notes notes/1.1.md   # notarize and publish the GitHub release
+```
+
+The script archives Redi, signs it with Developer ID and checks the result. It then builds a DMG,
+notarizes and staples it, and writes the Sparkle appcast with the new version added to the published
+one. Finally it creates the `v1.1` release on GitHub with the DMG and `appcast.xml` attached.
+Installed copies find updates at `releases/latest/download/appcast.xml`. The build number defaults to
+the commit count, and the script refuses to publish uncommitted or unpushed work. Read the header of
+the script for one-time setup: the Developer ID certificate, the notary profile and the Sparkle key.
