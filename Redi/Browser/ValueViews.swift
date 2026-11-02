@@ -11,11 +11,15 @@ import SwiftUI
     var streamGroups = TableColumnCustomization<StreamGroup>()
     var streamConsumers = TableColumnCustomization<StreamConsumer>()
     var streamPending = TableColumnCustomization<PendingMessage>()
+
+    /// Used only where no `BrowserView` provides a window's own. Created once: a default that's an
+    /// expression would make a new object on every environment read and invalidate the views using it.
+    static let fallback = ValueTableColumns()
 }
 
 extension EnvironmentValues {
     /// Provided by `BrowserView` for its window.
-    @Entry var valueTableColumns = ValueTableColumns()
+    @Entry var valueTableColumns: ValueTableColumns = .fallback
 }
 
 extension TableColumnContent {
