@@ -38,6 +38,8 @@ final class BrowserModel {
 
     private(set) var selectedIndex: Int?
     private(set) var detail: KeyDetailModel?
+    /// The value format picked in this window, applied to each key shown after it.
+    let formatPreference = FormatPreference()
     /// Keys deleted since the last reload (shown dimmed until the next refresh).
     @ObservationIgnored private(set) var deleted = Set<Int>()
 

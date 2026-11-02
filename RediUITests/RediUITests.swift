@@ -94,7 +94,7 @@ final class RediUITests: XCTestCase {
         stringRow.click()
         let decoded = workspace.textViews.matching(NSPredicate(format: "value CONTAINS %@", "\"created\": timestamp(2023-11-14T22:13:20Z)"))
         XCTAssertTrue(decoded.firstMatch.waitForExistence(timeout: 5), "The string should be detected as MessagePack and decoded")
-        XCTAssertTrue(workspace.popUpButtons.matching(NSPredicate(format: "value == 'MessagePack'")).firstMatch.exists)
+        XCTAssertTrue(workspace.popUpButtons.matching(NSPredicate(format: "value == 'Automatic (MessagePack)'")).firstMatch.exists)
         screenshot("MessagePack string")
 
         filter.click()

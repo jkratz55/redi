@@ -34,7 +34,7 @@ struct StringValueView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                FormatPicker(selection: $model.format)
+                FormatPicker(choice: $model.formatChoice, detected: model.detectedFormat)
                 if model.isTruncated {
                     Label("Showing the first \(Int64(StringValueModel.previewLimit).byteSize)", systemImage: "scissors")
                         .font(.callout).foregroundStyle(.secondary)
@@ -93,7 +93,7 @@ struct HashValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, formatChoice: $pager.formatChoice, detectedFormat: pager.detectedFormat, onSearch: { Task { await model.reload() } }) {
                 Button("Add Field", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Delete", systemImage: "minus") { delete(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
@@ -170,7 +170,7 @@ struct ListValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: .constant(""), supportsSearch: false, format: $pager.format, onSearch: {}) {
+            CollectionToolbar(search: .constant(""), supportsSearch: false, formatChoice: $pager.formatChoice, detectedFormat: pager.detectedFormat, onSearch: {}) {
                 Menu {
                     Button("Insert at Head (LPUSH)") { addingAtHead = true }
                     Button("Append to Tail (RPUSH)") { addingAtHead = false }
@@ -234,7 +234,7 @@ struct SetValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, formatChoice: $pager.formatChoice, detectedFormat: pager.detectedFormat, onSearch: { Task { await model.reload() } }) {
                 Button("Add Member", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Remove", systemImage: "minus") { remove(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
@@ -281,7 +281,7 @@ struct SortedSetValueView: View {
     var body: some View {
         @Bindable var pager = model.pager
         VStack(spacing: 0) {
-            CollectionToolbar(search: $pager.search, supportsSearch: true, format: $pager.format, onSearch: { Task { await model.reload() } }) {
+            CollectionToolbar(search: $pager.search, supportsSearch: true, formatChoice: $pager.formatChoice, detectedFormat: pager.detectedFormat, onSearch: { Task { await model.reload() } }) {
                 Picker("Order", selection: $model.descending) {
                     Text("Lowest First").tag(false)
                     Text("Highest First").tag(true)
@@ -354,7 +354,7 @@ struct StreamValueView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
-                if tab == 0 { FormatPicker(selection: $pager.format) }
+                if tab == 0 { FormatPicker(choice: $pager.formatChoice, detected: pager.detectedFormat) }
                 Spacer()
                 if tab == 0 {
                     Button("Add Entry", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)

@@ -29,12 +29,14 @@ final class KeyDetailModel {
     var error: String?
 
     @ObservationIgnored private weak var browser: BrowserModel?
+    @ObservationIgnored private let formatPreference: FormatPreference
 
     init(key: [UInt8], session: RedisSession, browser: BrowserModel, isReadOnly: Bool) {
         self.key = key
         ops = KeyOperations(session: session)
         self.browser = browser
         self.isReadOnly = isReadOnly
+        formatPreference = browser.formatPreference
     }
 
     var name: String { key.displayText }
@@ -65,28 +67,29 @@ final class KeyDetailModel {
             value = .missing
             browser?.markDeleted(key)
         case .string:
-            let model = reuse(\.string) ?? StringValueModel(key: key, ops: ops, report: report, onChange: onChange)
+            let model = reuse(\.string) ?? StringValueModel(key: key, ops: ops, formatPreference: formatPreference, report: report, onChange: onChange)
             value = .string(model)
             await model.load()
         case .hash:
             let fieldTTL = await session.hello?.version ?? ServerVersion(0) >= ServerVersion(7, 4)
-            let model = reuse(\.hash) ?? HashValueModel(key: key, ops: ops, supportsFieldTTL: fieldTTL, report: report, onChange: onChange)
+            let model = reuse(\.hash) ?? HashValueModel(key: key, ops: ops, supportsFieldTTL: fieldTTL, formatPreference: formatPreference,
+                                                               report: report, onChange: onChange)
             value = .hash(model)
             await model.reload()
         case .list:
-            let model = reuse(\.list) ?? ListValueModel(key: key, ops: ops, report: report, onChange: onChange)
+            let model = reuse(\.list) ?? ListValueModel(key: key, ops: ops, formatPreference: formatPreference, report: report, onChange: onChange)
             value = .list(model)
             await model.reload()
         case .set:
-            let model = reuse(\.set) ?? SetValueModel(key: key, ops: ops, report: report, onChange: onChange)
+            let model = reuse(\.set) ?? SetValueModel(key: key, ops: ops, formatPreference: formatPreference, report: report, onChange: onChange)
             value = .set(model)
             await model.reload()
         case .zset:
-            let model = reuse(\.zset) ?? SortedSetValueModel(key: key, ops: ops, report: report, onChange: onChange)
+            let model = reuse(\.zset) ?? SortedSetValueModel(key: key, ops: ops, formatPreference: formatPreference, report: report, onChange: onChange)
             value = .zset(model)
             await model.reload()
         case .stream:
-            let model = reuse(\.stream) ?? StreamValueModel(key: key, ops: ops, report: report, onChange: onChange)
+            let model = reuse(\.stream) ?? StreamValueModel(key: key, ops: ops, formatPreference: formatPreference, report: report, onChange: onChange)
             value = .stream(model)
             await model.reload()
         case .json:
@@ -147,6 +150,13 @@ extension KeyDetailModel.Value {
 // MARK: - Value models
 
 /// Paging state for a collection value (HSCAN/SSCAN/ZSCAN cursors or LRANGE/ZRANGE offsets).
+/// The format the user picked in a window, kept as they move between keys. `nil` (Automatic) lets
+/// each key use the format detected from its value.
+@Observable
+final class FormatPreference {
+    var choice: ValueFormat?
+}
+
 @Observable
 final class CollectionPager<Element: Identifiable & Sendable> {
     private(set) var elements: [Element] = []
@@ -154,9 +164,22 @@ final class CollectionPager<Element: Identifiable & Sendable> {
     /// Cursor or offset for the next page; `nil` when everything is loaded.
     private(set) var next: String? = "0"
     var search = ""
-    /// How element values are shown. Chosen from the first page that has elements, unless set first.
-    var format: ValueFormat = .text {
+    /// How element values are shown: the window's chosen format, or else the one detected from the
+    /// first page that has elements, unless set first.
+    var format: ValueFormat {
         didSet { hasFormat = true }
+    }
+    /// What the first page with elements looks like, whether or not a chosen format overrides it.
+    private(set) var detectedFormat: ValueFormat?
+    /// The format picker's selection: a format kept across keys, or `nil` for Automatic.
+    var formatChoice: ValueFormat? {
+        get { formatPreference.choice }
+        set {
+            formatPreference.choice = newValue
+            format = newValue ?? detectedFormat ?? .text
+            // Automatic before anything has loaded still detects from the first page.
+            if newValue == nil, detectedFormat == nil { hasFormat = false }
+        }
     }
     let supportsSearch: Bool
     let pageSize = 200
@@ -165,13 +188,18 @@ final class CollectionPager<Element: Identifiable & Sendable> {
     @ObservationIgnored private let report: (any Error) -> Void
     /// The values of an element that `format` applies to, for picking the initial format.
     @ObservationIgnored private let formattedValues: (Element) -> [[UInt8]]
-    @ObservationIgnored private(set) var hasFormat = false
+    @ObservationIgnored private(set) var hasFormat: Bool
+    @ObservationIgnored private let formatPreference: FormatPreference
     /// Bumped by `reload`. A load that finds it changed after a fetch was superseded, and drops its page.
     @ObservationIgnored private var generation = 0
 
-    init(supportsSearch: Bool, report: @escaping (any Error) -> Void, formattedValues: @escaping (Element) -> [[UInt8]],
+    init(supportsSearch: Bool, formatPreference: FormatPreference = FormatPreference(), report: @escaping (any Error) -> Void,
+         formattedValues: @escaping (Element) -> [[UInt8]],
          fetch: @escaping (_ cursor: String, _ pattern: String?) async throws -> ValuePage<Element>) {
         self.supportsSearch = supportsSearch
+        self.formatPreference = formatPreference
+        format = formatPreference.choice ?? .text
+        hasFormat = formatPreference.choice != nil
         self.report = report
         self.formattedValues = formattedValues
         self.fetch = fetch
@@ -217,8 +245,10 @@ final class CollectionPager<Element: Identifiable & Sendable> {
             }
             elements.append(contentsOf: collected)
             next = cursor
-            if !hasFormat, !collected.isEmpty {
-                format = ValueFormatter.detect(elements: collected.prefix(32).flatMap(formattedValues))
+            if detectedFormat == nil, !collected.isEmpty {
+                let detected = ValueFormatter.detect(elements: collected.prefix(32).flatMap(formattedValues))
+                detectedFormat = detected
+                if !hasFormat { format = detected }
             }
         } catch {
             guard generation == loading else { return }
@@ -252,15 +282,28 @@ final class StringValueModel {
     var format: ValueFormat = .text {
         didSet { if oldValue != format { text = rendered() } }
     }
+    /// The format that suits the loaded value, whether or not a chosen format overrides it.
+    private(set) var detectedFormat: ValueFormat?
+    /// The format picker's selection: a format kept across keys, or `nil` for Automatic.
+    var formatChoice: ValueFormat? {
+        get { formatPreference.choice }
+        set {
+            formatPreference.choice = newValue
+            format = newValue ?? detectedFormat ?? .text
+        }
+    }
     var text = ""
+    @ObservationIgnored private let formatPreference: FormatPreference
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
     static let previewLimit = 1_048_576
 
-    init(key: [UInt8], ops: KeyOperations, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
+        self.formatPreference = formatPreference
         self.report = report
         self.onChange = onChange
     }
@@ -282,7 +325,9 @@ final class StringValueModel {
             let (value, truncated) = try await ops.string(key, limit: full ? Int.max : Self.previewLimit)
             bytes = value
             isTruncated = truncated
-            format = ValueFormatter.detect(value)
+            let detected = ValueFormatter.detect(value)
+            detectedFormat = detected
+            format = formatPreference.choice ?? detected
             text = rendered()
         } catch {
             report(error)
@@ -313,13 +358,15 @@ final class HashValueModel {
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
-    init(key: [UInt8], ops: KeyOperations, supportsFieldTTL: Bool, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, supportsFieldTTL: Bool, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
         self.supportsFieldTTL = supportsFieldTTL
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.value] }) { cursor, pattern in
+        pager = CollectionPager(supportsSearch: true, formatPreference: formatPreference, report: report,
+                                formattedValues: { [$0.value] }) { cursor, pattern in
             try await ops.hashPage(key, cursor: cursor, match: pattern, count: 200, withFieldTTL: supportsFieldTTL)
         }
     }
@@ -358,12 +405,14 @@ final class ListValueModel {
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
-    init(key: [UInt8], ops: KeyOperations, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: false, report: report, formattedValues: { [$0.value] }) { cursor, _ in
+        pager = CollectionPager(supportsSearch: false, formatPreference: formatPreference, report: report,
+                                formattedValues: { [$0.value] }) { cursor, _ in
             let start = Int(cursor) ?? 0
             let entries = try await ops.listRange(key, start: start, count: 200)
             return ValuePage(elements: entries, next: entries.count == 200 ? String(start + entries.count) : nil)
@@ -406,12 +455,14 @@ final class SetValueModel {
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
-    init(key: [UInt8], ops: KeyOperations, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.value] }) { cursor, pattern in
+        pager = CollectionPager(supportsSearch: true, formatPreference: formatPreference, report: report,
+                                formattedValues: { [$0.value] }) { cursor, pattern in
             let page = try await ops.setPage(key, cursor: cursor, match: pattern, count: 200)
             return ValuePage(elements: page.elements.map(SetMember.init), next: page.next)
         }
@@ -450,12 +501,15 @@ final class SortedSetValueModel {
             Task { await reload() }
         }
     }
+    @ObservationIgnored private let formatPreference: FormatPreference
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
-    init(key: [UInt8], ops: KeyOperations, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
+        self.formatPreference = formatPreference
         self.report = report
         self.onChange = onChange
         pager = CollectionPager(supportsSearch: true, report: report, formattedValues: { _ in [] }) { _, _ in ValuePage(elements: [], next: nil) }
@@ -464,7 +518,8 @@ final class SortedSetValueModel {
 
     private func makePager() -> CollectionPager<SortedSetEntry> {
         let (key, ops, descending) = (self.key, self.ops, self.descending)
-        return CollectionPager(supportsSearch: true, report: report, formattedValues: { [$0.member] }) { cursor, pattern in
+        return CollectionPager(supportsSearch: true, formatPreference: formatPreference, report: report,
+                               formattedValues: { [$0.member] }) { cursor, pattern in
             if let pattern {
                 return try await ops.sortedSetPage(key, cursor: cursor, match: pattern, count: 200)
             }
@@ -503,12 +558,14 @@ final class StreamValueModel {
     @ObservationIgnored private let report: (any Error) -> Void
     @ObservationIgnored private let onChange: () -> Void
 
-    init(key: [UInt8], ops: KeyOperations, report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
+    init(key: [UInt8], ops: KeyOperations, formatPreference: FormatPreference = FormatPreference(),
+         report: @escaping (any Error) -> Void, onChange: @escaping () -> Void) {
         self.key = key
         self.ops = ops
         self.report = report
         self.onChange = onChange
-        pager = CollectionPager(supportsSearch: false, report: report, formattedValues: { $0.fields.map(\.value) }) { cursor, _ in
+        pager = CollectionPager(supportsSearch: false, formatPreference: formatPreference, report: report,
+                                formattedValues: { $0.fields.map(\.value) }) { cursor, _ in
             try await ops.streamPage(key, before: cursor == "0" ? nil : cursor, count: 200)
         }
     }

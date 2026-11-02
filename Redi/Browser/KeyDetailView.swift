@@ -186,15 +186,21 @@ struct KeyDetailView: View {
 // MARK: - Shared pieces
 
 /// How values are shown: Unicode, JSON, MessagePack, HEX…
+/// A format picked here stays as the user moves between keys; Automatic uses the one detected
+/// for each key, and names it.
 struct FormatPicker: View {
-    @Binding var selection: ValueFormat
+    @Binding var choice: ValueFormat?
+    let detected: ValueFormat?
 
     var body: some View {
-        Picker("Format", selection: $selection) {
-            ForEach(ValueFormat.allCases) { Text($0.displayName).tag($0) }
+        Picker("Format", selection: $choice) {
+            Text(detected.map { String(localized: "Automatic (\($0.displayName))") } ?? String(localized: "Automatic"))
+                .tag(ValueFormat?.none)
+            Divider()
+            ForEach(ValueFormat.allCases) { Text($0.displayName).tag(ValueFormat?.some($0)) }
         }
         .fixedSize()
-        .help("How values are shown")
+        .help("How values are shown. Automatic picks a format for each key; any other format stays as you move between keys.")
     }
 }
 
@@ -202,7 +208,8 @@ struct FormatPicker: View {
 struct CollectionToolbar<Trailing: View>: View {
     @Binding var search: String
     let supportsSearch: Bool
-    @Binding var format: ValueFormat
+    @Binding var formatChoice: ValueFormat?
+    let detectedFormat: ValueFormat?
     let onSearch: () -> Void
     @ViewBuilder var trailing: Trailing
 
@@ -214,7 +221,7 @@ struct CollectionToolbar<Trailing: View>: View {
                     .frame(maxWidth: 260)
                     .onSubmit(onSearch)
             }
-            FormatPicker(selection: $format)
+            FormatPicker(choice: $formatChoice, detected: detectedFormat)
             Spacer()
             trailing
         }
