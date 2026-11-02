@@ -9,13 +9,17 @@ struct BrowserView: View {
     @State private var pendingDelete: BrowserModel.DeleteRequest?
     @State private var isAddingKey = false
     @State private var isBulkDeleting = false
+    @State private var valueColumns = ValueTableColumns()
 
     var body: some View {
         HSplitView {
             keyPane
                 .frame(minWidth: 300, idealWidth: 420, maxWidth: 800, maxHeight: .infinity)
-            detailPane
+            // The split view replaces a pane whose identity changes, and moves the divider when it
+            // does. The detail changes identity with every key, so it sits in a container that doesn't.
+            ZStack { detailPane }
                 .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                .environment(\.valueTableColumns, valueColumns)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task {

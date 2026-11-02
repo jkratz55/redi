@@ -1,6 +1,30 @@
 import RediCore
 import SwiftUI
 
+/// Column widths for the value tables, shared by every key a window shows. Each key gets a new
+/// editor, so without this a column the user resized snapped back when another key was selected.
+@Observable final class ValueTableColumns {
+    var hash = TableColumnCustomization<HashEntry>()
+    var list = TableColumnCustomization<ListEntry>()
+    var sortedSet = TableColumnCustomization<SortedSetEntry>()
+    var streamEntries = TableColumnCustomization<StreamEntry>()
+    var streamGroups = TableColumnCustomization<StreamGroup>()
+    var streamConsumers = TableColumnCustomization<StreamConsumer>()
+    var streamPending = TableColumnCustomization<PendingMessage>()
+}
+
+extension EnvironmentValues {
+    /// Provided by `BrowserView` for its window.
+    @Entry var valueTableColumns = ValueTableColumns()
+}
+
+extension TableColumnContent {
+    /// Remembers the column's width in `ValueTableColumns`. Moving and hiding columns stay off, as before.
+    func remembersWidth(_ id: String) -> some TableColumnContent<TableRowValue, TableColumnSortComparator> {
+        customizationID(id).disabledCustomizationBehavior([.reorder, .visibility])
+    }
+}
+
 // MARK: - String
 
 struct StringValueView: View {
@@ -64,6 +88,7 @@ struct HashValueView: View {
     @State private var selection = Set<HashEntry.ID>()
     @State private var editing: HashEntry?
     @State private var isAdding = false
+    @Environment(\.valueTableColumns) private var columnWidths
 
     var body: some View {
         @Bindable var pager = model.pager
@@ -72,14 +97,17 @@ struct HashValueView: View {
                 Button("Add Field", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Delete", systemImage: "minus") { delete(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
-            Table(pager.elements, selection: $selection) {
+            Table(pager.elements, selection: $selection, columnCustomization: Bindable(columnWidths).hash) {
                 TableColumn("Field") { Text($0.field.displayText).font(.body.monospaced()).lineLimit(1) }
+                    .remembersWidth("field")
                 TableColumn("Value") { Text(ValueFormatter.cellText($0.value, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
+                    .remembersWidth("value")
                 if model.supportsFieldTTL {
                     TableColumn("TTL") { entry in
                         Text(entry.ttl.map { ($0 * 1000).ttlDescription } ?? "∞").foregroundStyle(.secondary).monospacedDigit()
                     }
                     .width(70)
+                    .remembersWidth("ttl")
                 }
             }
             .contextMenu(forSelectionType: HashEntry.ID.self) { ids in
@@ -135,6 +163,7 @@ struct ListValueView: View {
     let model: ListValueModel
     let isReadOnly: Bool
     @State private var selection = Set<ListEntry.ID>()
+    @Environment(\.valueTableColumns) private var columnWidths
     @State private var editing: ListEntry?
     @State private var addingAtHead: Bool?
 
@@ -152,10 +181,12 @@ struct ListValueView: View {
                 .disabled(isReadOnly)
                 Button("Remove", systemImage: "minus") { remove() }.disabled(isReadOnly || selection.count != 1)
             }
-            Table(pager.elements, selection: $selection) {
+            Table(pager.elements, selection: $selection, columnCustomization: Bindable(columnWidths).list) {
                 TableColumn("Index") { Text($0.index, format: .number).foregroundStyle(.secondary).monospacedDigit() }
                     .width(70)
+                    .remembersWidth("index")
                 TableColumn("Element") { Text(ValueFormatter.cellText($0.value, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
+                    .remembersWidth("element")
             }
             .contextMenu(forSelectionType: ListEntry.ID.self) { ids in
                 if !isReadOnly, ids.count == 1 {
@@ -243,6 +274,7 @@ struct SortedSetValueView: View {
     @Bindable var model: SortedSetValueModel
     let isReadOnly: Bool
     @State private var selection = Set<SortedSetEntry.ID>()
+    @Environment(\.valueTableColumns) private var columnWidths
     @State private var editing: SortedSetEntry?
     @State private var isAdding = false
 
@@ -259,9 +291,11 @@ struct SortedSetValueView: View {
                 Button("Add Member", systemImage: "plus") { isAdding = true }.disabled(isReadOnly)
                 Button("Remove", systemImage: "minus") { remove(selection) }.disabled(isReadOnly || selection.isEmpty)
             }
-            Table(pager.elements, selection: $selection) {
+            Table(pager.elements, selection: $selection, columnCustomization: Bindable(columnWidths).sortedSet) {
                 TableColumn("Score") { Text($0.score, format: .number).monospacedDigit() }.width(110)
+                    .remembersWidth("score")
                 TableColumn("Member") { Text(ValueFormatter.cellText($0.member, as: pager.format)).font(.body.monospaced()).lineLimit(1) }
+                    .remembersWidth("member")
             }
             .contextMenu(forSelectionType: SortedSetEntry.ID.self) { ids in
                 if !isReadOnly {
@@ -307,6 +341,7 @@ struct StreamValueView: View {
     @State private var pendingSelection = Set<PendingMessage.ID>()
     @State private var isAdding = false
     @State private var isCreatingGroup = false
+    @Environment(\.valueTableColumns) private var columnWidths
 
     var body: some View {
         @Bindable var pager = model.pager
@@ -356,17 +391,20 @@ struct StreamValueView: View {
         let pager = model.pager
         let columns = Array(model.fieldNames.prefix(12))
         return VStack(spacing: 0) {
-            Table(pager.elements, selection: $selection) {
+            Table(pager.elements, selection: $selection, columnCustomization: Bindable(columnWidths).streamEntries) {
                 TableColumn("ID") { Text($0.id).font(.body.monospaced()) }.width(min: 150, ideal: 170)
+                    .remembersWidth("id")
                 TableColumn("Time") { entry in
                     Text(entry.date.map { $0.formatted(date: .numeric, time: .standard) } ?? "").foregroundStyle(.secondary)
                 }
                 .width(min: 120, ideal: 150)
+                .remembersWidth("time")
                 TableColumnForEach(columns, id: \.self) { name in
                     TableColumn(name) { entry in
                         Text(entry.fields.first { $0.name.displayText == name }.map { ValueFormatter.cellText($0.value, as: pager.format) } ?? "")
                             .font(.body.monospaced()).lineLimit(1)
                     }
+                    .remembersWidth("field:" + name)
                 }
             }
             Divider()
@@ -379,12 +417,13 @@ struct StreamValueView: View {
     private var groups: some View {
         VStack(spacing: 0) {
             Table(model.groups, selection: Binding(get: { model.selectedGroup.map { Set([$0]) } ?? [] },
-                                                   set: { model.selectedGroup = $0.first })) {
-                TableColumn("Group") { Text($0.name).font(.body.monospaced()) }
-                TableColumn("Consumers") { Text($0.consumers, format: .number) }.width(80)
-                TableColumn("Pending") { Text($0.pending, format: .number) }.width(70)
-                TableColumn("Last Delivered") { Text($0.lastDeliveredID).font(.body.monospaced()) }
-                TableColumn("Lag") { Text($0.lag.map { $0.formatted() } ?? "—") }.width(60)
+                                                   set: { model.selectedGroup = $0.first }),
+                  columnCustomization: Bindable(columnWidths).streamGroups) {
+                TableColumn("Group") { Text($0.name).font(.body.monospaced()) }.remembersWidth("group")
+                TableColumn("Consumers") { Text($0.consumers, format: .number) }.width(80).remembersWidth("consumers")
+                TableColumn("Pending") { Text($0.pending, format: .number) }.width(70).remembersWidth("pending")
+                TableColumn("Last Delivered") { Text($0.lastDeliveredID).font(.body.monospaced()) }.remembersWidth("lastDelivered")
+                TableColumn("Lag") { Text($0.lag.map { $0.formatted() } ?? "—") }.width(60).remembersWidth("lag")
             }
             .contextMenu(forSelectionType: String.self) { names in
                 if !isReadOnly, let name = names.first {
@@ -394,18 +433,18 @@ struct StreamValueView: View {
             .frame(minHeight: 110)
             Divider()
             HSplitView {
-                Table(model.consumers) {
-                    TableColumn("Consumer") { Text($0.name) }
-                    TableColumn("Pending") { Text($0.pending, format: .number) }.width(70)
-                    TableColumn("Idle") { Text($0.idleMilliseconds.ttlDescription).foregroundStyle(.secondary) }.width(70)
+                Table(model.consumers, columnCustomization: Bindable(columnWidths).streamConsumers) {
+                    TableColumn("Consumer") { Text($0.name) }.remembersWidth("consumer")
+                    TableColumn("Pending") { Text($0.pending, format: .number) }.width(70).remembersWidth("pending")
+                    TableColumn("Idle") { Text($0.idleMilliseconds.ttlDescription).foregroundStyle(.secondary) }.width(70).remembersWidth("idle")
                 }
                 .frame(minWidth: 200)
                 VStack(spacing: 0) {
-                    Table(model.pending, selection: $pendingSelection) {
-                        TableColumn("Pending ID") { Text($0.id).font(.body.monospaced()) }
-                        TableColumn("Consumer") { Text($0.consumer) }
-                        TableColumn("Idle") { Text($0.idleMilliseconds.ttlDescription).foregroundStyle(.secondary) }.width(70)
-                        TableColumn("Deliveries") { Text($0.deliveryCount, format: .number) }.width(70)
+                    Table(model.pending, selection: $pendingSelection, columnCustomization: Bindable(columnWidths).streamPending) {
+                        TableColumn("Pending ID") { Text($0.id).font(.body.monospaced()) }.remembersWidth("id")
+                        TableColumn("Consumer") { Text($0.consumer) }.remembersWidth("consumer")
+                        TableColumn("Idle") { Text($0.idleMilliseconds.ttlDescription).foregroundStyle(.secondary) }.width(70).remembersWidth("idle")
+                        TableColumn("Deliveries") { Text($0.deliveryCount, format: .number) }.width(70).remembersWidth("deliveries")
                     }
                     HStack {
                         Spacer()
